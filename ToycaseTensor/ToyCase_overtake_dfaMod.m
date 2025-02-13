@@ -1,0 +1,340 @@
+clc
+clear all
+close all
+
+tic;
+
+%% notice: policy iteration is incorrect.
+%% case study overtake
+%% Specify system parameters and regions
+
+N = 1000;     % time horizon
+numSim = 1000;
+int_f = true;
+
+% Define the bounds on states and inputs
+state_lb = [-15,-1.8,-11,-1];
+state_ub = [15,5.4,11,1];
+input_lb = [-1.5,-0.5];
+input_ub = [1.5,0.5];
+state_bound = [state_lb;state_ub];
+
+% Set up an LTI model
+[LTIsys] = trafficSys_mod(0.5,state_lb,state_ub,input_lb,input_ub);
+
+
+% Abstraction parameters
+lu = 15;  % number of abstract inputs
+l = [10,5];  % number of grid cells (states) 
+tol=10^-6;
+ln = floor(lu/2);
+
+% Specify threshold for convergence error
+thold = 1e-6;
+
+% Calculate optimal epsilon based on direction
+grid = (state_ub-state_lb)./[l,l];
+gridSq = grid.^2;
+eps.x = sqrt(sum(gridSq(1:2:end)));
+eps.y = sqrt(sum(gridSq(2:2:end)));
+
+% Create abstraction based on direction
+[uhat,LTIsys.x.U] = GridInputSpace(lu,LTIsys.x.U,'interface',int_f,0.6,0.4);
+% AbsSys.x = FSabstraction2_Pxix(LTIsys.x,uhat,l,tol,'','TensorComputation',true,'TensorToolbox','tensortoolbox');
+AbsSys.x = tensorAbs_overtake(LTIsys.x,uhat,l,tol,'TensorComputation',true);
+[uhat,LTIsys.y.U] = GridInputSpace(lu,LTIsys.y.U,'interface',int_f,0.6,0.4);
+% AbsSys.y = FSabstraction2_Pxix(LTIsys.y,uhat,l,tol,'','TensorComputation',true,'TensorToolbox','tensortoolbox');
+AbsSys.y = tensorAbs_overtake(LTIsys.y,uhat,l,tol,'TensorComputation',true);
+%% Application of modular solution
+
+% Defining a path
+polyShape = {'p1p3','p3',' ','p2','p1p2'};
+
+% Timebounds for specification
+timeB = 3;
+tBounds = int8(zeros(1,length(polyShape)-1)+timeB);
+
+% Create specification
+safe_dist = 5;
+spec = overtakeSpec_dfaMod(polyShape,state_bound, safe_dist);
+nodes = fieldnames(spec); % Node names
+
+consts = zeros(length(nodes),2);
+state = [];
+xsims = zeros(2,(timeB+1),numSim);
+
+Rank = 10;
+Rho = cell(2,1);
+for i = 1:2
+    Rho{i} = ones(l(1)*l(2),1)/(l(1)*l(2));
+end
+
+for i = length(nodes):-1:1
+    m = nodes{i};
+    fprintf("----------------------------- Running SySCoRe on %s -----------------------------\n",m);
+    for j = 1:length(spec.(m).formulas)
+        % Direction
+        dir = spec.(m).dir{j};
+        sysLTI = LTIsys.(dir);
+        
+        % Selection of atomic proposition, formulas and region
+        formula = timeBound(tBounds(i),char(spec.(m).formulas(j)));
+        sysLTI.regions = spec.(m).regions{j};
+
+        % Starting region
+        rect = spec.(m).rect{j};    
+        
+        % Epsilon vaue based on direction
+        epsilon = eps.(dir);
+        
+        fprintf("\nFormula: %s\n",formula);
+
+        % Translate specificaiton to DFA
+        [DFA] = TranslateSpec(formula,sysLTI.AP);
+%         dfaVisualization(DFA); % Visualize the DFA
+
+        sysAbs = AbsSys.(dir);
+
+        % Manually define the simulation relation
+        delta = 0.1;
+        R = eye(2);
+        Rel = SimRel(epsilon,delta,R);
+        Rel.NonDetLabels = NonDeterministicLabelling(sysAbs.outputs, sysLTI.regions, Rel, 'Efficient', sysAbs);
+        
+        %% sub RA problems are manually defined
+        %% TODO: 
+        if dir == 'x'
+           if i == 4
+               target1 = find(strcmp(DFA.act, 'p2'));
+               safe1 = find(strcmp(DFA.act, 'p2'));
+               ind_target1 = Rel.NonDetLabels(target1,:)';
+               ind_safe1 = Rel.NonDetLabels(safe1,:)';
+           elseif i == 3
+               % target1 = 
+               safe1 = find(strcmp(DFA.act, ' '));
+               ind_target1 = Mfactor{1};
+               ind_safe1 = Rel.NonDetLabels(safe1,:)';
+           elseif i == 2
+               safe1 = find(strcmp(DFA.act, 'p3'));
+               ind_target1 = Mfactor{1};
+               ind_safe1 = Rel.NonDetLabels(safe1,:)';
+           elseif i == 1
+               safe1 = find(strcmp(DFA.act, 'p3'));
+               ind_target1 = Mfactor{1};
+               ind_safe1 = Rel.NonDetLabels(safe1,:)'; 
+           end
+
+        elseif dir == 'y'
+           if i == 4
+               target2 = find(strcmp(DFA.act, 'p1'));
+               safe2 = find(strcmp(DFA.act, ' '));
+               ind_target2 = Rel.NonDetLabels(target2,:)';
+               ind_safe2 = Rel.NonDetLabels(safe2,:)';
+           elseif i == 3
+                
+               safe2 = find(strcmp(DFA.act, ' '));
+               ind_target2 = Mfactor{2};
+               ind_safe2 = Rel.NonDetLabels(safe2,:)';
+           elseif i == 2
+               safe2 = find(strcmp(DFA.act, ' '));
+               ind_target2 = Mfactor{2};
+               ind_safe2 = Rel.NonDetLabels(safe2,:)';
+           elseif i == 1
+               safe2 = find(strcmp(DFA.act, 'p1'));
+               ind_target2 = Mfactor{2};
+               ind_safe2 = Rel.NonDetLabels(safe2,:)'; 
+           end
+            
+        end
+        
+
+    end
+    Pol = cell(2,1);
+    nx = l(1)*l(2);
+    Pol{1} = rand(nx,lu);
+    Pol{2} = rand(nx,lu);
+    Pol{1} = Pol{1} ./ sum(Pol{1}, 2);  
+    Pol{1} = Pol{1} .* rand(nx, 1);  
+    Pol{2} = Pol{2} ./ sum(Pol{2}, 2);  
+    Pol{2} = Pol{2} .* rand(nx, 1);  
+   %    # weird policy, not normalized etc
+
+
+
+    sysAbs = cell(2,1);
+    sysAbs{1} = AbsSys.x;
+    sysAbs{2} = AbsSys.y;
+    Mfactor = PI_subRA_Vprop(Rank,nx,Rho,i,Pol,ind_safe1,ind_safe2,ind_target1,ind_target2,sysAbs,2);
+    % why is there no policy update?
+    figure
+    subplot(3,1,1)
+    plot_overtake({ind_safe1,ind_safe2},sysAbs,{2,2})
+    title('safe set')
+    
+    subplot(3,1,2)
+    plot_overtake({ind_target1,ind_target2},sysAbs,{2,2})
+    title('target set')
+
+    
+    
+    subplot(3,1,3)
+
+    plot_overtake(Mfactor,sysAbs,{2,2})
+    title('value function')
+
+    disp('next')
+end
+
+TotalRuntime  = toc;
+d = whos();
+d = sum([d.bytes])
+memory = d*10^(-6);
+
+plot_overtake(Mfactor,sysAbs,{2,2})
+
+fprintf('Memory usage in total is: %.2f MB \n', memory);
+fprintf('Total runtime is: %.2f seconds \n', TotalRuntime);
+
+% clc;
+% clear all;
+% close all;
+% 
+% %% overtake scenario
+% % 4 dimensional system
+% % specification decomposed into 2 RA subproblems
+% 
+% %% system dynamics
+% no_subsys = 2; % original system decoupled into no_subsys subsystems
+% DFA = cell(no_subsys,1);
+% A = cell(no_subsys,1);
+% B = cell(no_subsys,1);
+% C = cell(no_subsys,1);
+% D = cell(no_subsys,1);
+% Bw = cell(no_subsys,1);
+% 
+% mu = cell(no_subsys,1);
+% sigma = cell(no_subsys,1);
+% 
+% 
+% dim_subsys = 2; % dimension of each subsystem
+% deltaT = 0.5;
+% A{1} = [1 deltaT; 0 1];
+% A{2} = [1 deltaT; 0 1];
+% B{1} = [0 deltaT]';
+% B{2} = [0 deltaT]';
+% C{1} = eye(dim_subsys);
+% C{2} = eye(dim_subsys);
+% D{1} = zeros(dim_subsys,1);
+% D{2} = zeros(dim_subsys,1);
+% Bw{1} = eye(dim_subsys)*0.01;
+% Bw{2} = eye(dim_subsys)*0.01;
+% mu{1} = zeros(dim_subsys,1);
+% mu{2} = zeros(dim_subsys,1);
+% sigma{1} = eye(dim_subsys);
+% sigma{2} = eye(dim_subsys);
+% 
+% 
+% sysLTI = cell(no_subsys,1);
+% uhat = cell(no_subsys,1);
+% sysAbs = cell(no_subsys,1);
+% 
+% %% boundary of state and input space
+% % state space
+% x1_l = -15;
+% x1_u = 15;
+% v1_l = -11;
+% v1_u = 11;
+% 
+% x2_l = -1.8;
+% x2_u = 5.4;
+% v2_l = -1;
+% v2_u = 1;
+% 
+% % input space
+% u1_l = -1.5;
+% u1_u = 1.5;
+% 
+% u2_l = -0.5;
+% u2_u = 0.5;
+% %% abstraction
+% 
+% l = [51 31];
+% tol=10^-19;  
+% lu = 15; 
+% nx = cell(no_subsys,1);
+% 
+% for i=1:no_subsys
+%     sysLTI{i} = LinModel(A{i}, B{i}, C{i}, D{i}, Bw{i}, mu{i}, sigma{i});
+%     if i == 1 % for x1 direction
+%         sysLTI{i}.X = Polyhedron(combvec([x1_l,x1_u],[v1_l,v1_u])');
+%         sysLTI{i}.U = Polyhedron(combvec([u1_l,u1_u])');
+%     else  % for x2 direction
+%             sysLTI{i}.X = Polyhedron(combvec([x2_l,x2_u],[v1_l,v2_u])');
+%             sysLTI{i}.U = Polyhedron(combvec([u2_l,u2_u])');
+%     end
+%     uhat{i} = GridInputSpace(lu,sysLTI{i}.U,'log');
+%     nu = size(uhat{i},2);
+%     sysAbs{i} = FSabstraction2_Pxix(sysLTI{i},uhat{i},l,tol,'','TensorComputation',true,'TensorToolbox','tensortoolbox');
+%     nx{i} = size(sysAbs{i}.states,2);
+% end
+% 
+% %% Atomic propositions
+% % right lane %% for 1st subsystem
+% p1x = [-15 15 -15 -15 15];    % x1-coordinates = whole 
+% p1y = [1.8 -1.8 -1.8 1.8 1.8];    % x2-coordinates  
+% P1 = Polyhedron([p1x; p1y]');
+% 
+% % in front of opponent
+% p2x = [5 20 5 5 20];    % x1-coordinates 
+% p2y = [5.4 -1.8 -1.8 5.4 5.4];    % x2-coordinates = whole 
+% P2 = Polyhedron([p2x; p2y]');
+% 
+% % behind opponent
+% p3x = [-20 -5 -20 -20 -5];    % x1-coordinates 
+% p3y = [5.4 -1.8 -1.8 5.4 5.4];    % x2-coordinates = whole 
+% P3 = Polyhedron([p3x; p3y]');
+% 
+% for i=1:no_subsys
+%     sysLTI{i}.regions = [P1;P2;P3]; 
+% % Propositions corresponding to the regions
+%     sysLTI{i}.AP = {'p1', 'p2','p3'}; 
+% end
+% 
+% formula = '(!p1 | (p3 | p2))U ((p1 & p2) & (!p1 | (p3 | p2)))';
+% 
+% 
+% [DFA{1}] = TranslateSpec(formula,sysLTI{1}.AP);
+% [DFA{2}] = TranslateSpec(formula,sysLTI{2}.AP);
+% 
+% %% TODO: create DFAs for sub RA problems  
+% %% TODO: label states
+% %% TODO: dynamic programming
+% 
+% R = 15;
+% Rho = cell(no_subsys,1);
+% for i = 1:no_subsys
+%     Rho{i} = ones(nx{i},1)/nx{i};
+% end
+% 
+% part = 1;
+% Pol = cell(no_subsys,1);
+% Pol{1} = zeros(nx{1},nu);
+% Pol{2} = zeros(nx{2},nu);
+% Pol{1}(:,1) = 1;
+% Pol{2}(:,1) = 1;
+% 
+% %% TODO: replace this with labeling
+% ind_target1  = zeros(nx{1},1);
+% ind_target1(sysAbs{1}.states(1,:) > 5) = 1;
+% ind_target2 = zeros(nx{2},1);
+% ind_target2(sysAbs{2}.states(1,:) < 1.8) = 1;
+% 
+% ind_safe1 = zeros(nx{1},1);
+% ind_safe1(sysAbs{1}.states(1,:) > -5) = 1;
+% ind_safe2 = zeros(nx{2},1);
+% ind_safe2(sysAbs{2}.states(1,:) >= 1.8) = 1;
+% 
+% Mfactor = PI_subRA_Vprop(R,nx,Rho,part,Pol,ind_safe1,ind_safe2,ind_target1,ind_target2,sysAbs,no_subsys);
+% 
+% 
+% 
