@@ -5,8 +5,8 @@ import itertools
 from typing import List, Dict, Any, Optional, Tuple
 import sys
 
-from abstraction.gridinput import grid_input_space
-from models.linmodel import LinModel
+from src.abstraction.gridinput import grid_input_space
+from linmodel import LinModel
 from specifications.translate import *
 from abstraction.gridinput import *
 
