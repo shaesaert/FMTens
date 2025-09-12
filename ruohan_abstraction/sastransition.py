@@ -7,15 +7,14 @@ import polytope as pc
 from scipy.special import erf as _erf
 
 
-
 def _normal_cdf(x, m, s):
-    """Gaussian CDF with mean m, std s; supports numpy broadcasting."""
+    """Gaussian CDF with mean m and std s; supports NumPy broadcasting."""
     z = (x - m) / (s * np.sqrt(2.0))
     return 0.5 * (1.0 + _erf(z))
 
 
 def _bbox_from_poly(P):
-    """Bounding box [lower, upper] per dimension from vertices."""
+    """Return per-dimension bounding box [lower, upper] computed from polytope vertices."""
     V = pc.extreme(P)                              # list of vertices
     V = np.array([np.array(v).ravel() for v in V]) # (nv, n)
     lower = V.min(axis=0)
@@ -25,8 +24,9 @@ def _bbox_from_poly(P):
 
 def _edges_from_axes(X_axes, X_poly):
     """
-    From per-dimension axis arrays -> per-dimension edges arrays of length (l_d+1).
-    Edges use domain bounds at both ends, midpoints inside.
+    From per-dimension axis arrays -> per-dimension edge arrays of length (l_d + 1).
+    Edges use domain bounds at both ends and midpoints in between.
+    If an axis has a single point, create a tiny 2-edge bin around it.
     """
     lower, upper = _bbox_from_poly(X_poly)
     edges = []
@@ -45,8 +45,8 @@ def _edges_from_axes(X_axes, X_poly):
 
 def _diag_std_from_noise(Bw, Sigma_w):
     """
-    std of x^+ contributed by noise: sqrt(diag(Bw * Sigma_w * Bw^T)).
-    Treats dimensions independently (off-diagonals ignored in the final formula).
+    Std of x^+ contributed by noise: sqrt(diag(Bw * Sigma_w * Bw^T)).
+    Treat dimensions independently (off-diagonals are ignored in the final result).
     """
     Sigma_x = Bw @ Sigma_w @ Bw.T
     var = np.clip(np.diag(Sigma_x), a_min=0.0, a_max=None)
@@ -58,23 +58,33 @@ def transition_matrix_nd_separable(
     sys, X_axes, U_points, X_poly, tol=1e-15, renormalize=True, return_flat=True
 ):
     """
-    构造 n 维（按维独立）的高斯噪声离散转移矩阵（等价你 MATLAB 版本的 cp/kronecker 实现）。
+    Build an n-dimensional (dimension-wise independent) Gaussian-noise transition matrix.
+    This matches the MATLAB cp/Kronecker implementation you used.
 
-    参数
-    ----
-    sys        : LinModel（A(n,n), B(n,m), Bw(n,r), mu(r,1), sigma(r,r)）
-    X_axes     : list 长度为 n，每维一个 1D numpy 数组（状态网格轴）
-    U_points   : 离散输入集合；形状可为 (M,), (1,M), (M,1), (M,m) 等，函数会自动矫正为 (M,m)
-    X_poly     : 状态域 Polytope（用于生成各维箱子边界）
-    tol        : 小于该阈值的概率置 0
-    renormalize: 是否对每个输入块的概率分布做归一化（域外概率丢弃后重归一）
-    return_flat: True→返回 (N, N*M)，False→返回 (N, N, M)
+    Parameters
+    ----------
+    sys : LinModel
+        Contains A(n,n), B(n,m), Bw(n,r), mu(r,1), sigma(r,r).
+    X_axes : list[np.ndarray]
+        Length n; one 1D array per state dimension (grid axis). Typically cell centers.
+    U_points : array-like
+        Discrete input set. Accepted shapes: (M,), (1, M), (M, 1), (M, m), etc.
+        Will be reshaped to (M, m) internally.
+    X_poly : polytope.Polytope
+        State domain polytope used to construct bin edges.
+    tol : float
+        Entries smaller than this are set to 0.
+    renormalize : bool
+        If True, renormalize each (row, action) distribution to sum to 1
+        after discarding probability mass outside the domain.
+    return_flat : bool
+        If True, return shape (N, N*M); else return (N, N, M).
 
-    返回
-    ----
-    P: numpy.ndarray
-       - return_flat=True : (N, N*M)，第 k 块列为输入 u_k 下的 N×N 概率
-       - return_flat=False: (N, N, M)
+    Returns
+    -------
+    P : np.ndarray
+        - If return_flat=True : shape (N, N*M); the k-th action occupies columns [k*N : (k+1)*N)
+        - If return_flat=False: shape (N, N, M)
     """
     # --- unpack and shapes ---
     A = np.asarray(sys.A, dtype=float)
@@ -83,20 +93,20 @@ def transition_matrix_nd_separable(
     mu_w = np.asarray(sys.mu, dtype=float).reshape(-1, 1)    # (r,1)
     Sigma_w = np.asarray(sys.sigma, dtype=float)             # (r,r)
 
-    n = A.shape[0]                          # state dim
+    n = A.shape[0]                          # state dimension
     X_axes = [np.asarray(ax, dtype=float).ravel() for ax in X_axes]
-    l = [ax.size for ax in X_axes]          # bins per dim
+    l = [ax.size for ax in X_axes]          # bins per dimension
     N = int(np.prod(l))                     # total bins / states
 
-    # --- robust U_points shape handling (方式B) ---
-    m = B.shape[1]                          # input dim
+    # --- robust U_points shape handling ---
+    m = B.shape[1]                          # input dimension
     U_points = np.asarray(U_points, dtype=float)
     if U_points.ndim == 1:
-        U_points = U_points.reshape(-1, m)  # (M,m)
+        U_points = U_points.reshape(-1, m)  # (M, m)
     else:
         if U_points.shape[1] != m:
             if U_points.shape[0] == m:
-                U_points = U_points.T       # (M,m)
+                U_points = U_points.T       # (M, m)
             else:
                 U_points = U_points.reshape(-1, m)
     M = U_points.shape[0]                   # number of inputs
@@ -109,7 +119,7 @@ def transition_matrix_nd_separable(
     if np.any(std == 0.0):
         raise ValueError("Some dimensions have zero noise std; handle degenerate dims separately.")
 
-    # --- build XhatSpace: (N,n) ---
+    # --- build XhatSpace: (N, n) ---
     meshes = np.meshgrid(*X_axes, indexing="ij")
     XhatSpace = np.stack([m_.reshape(-1) for m_ in meshes], axis=1)
 
