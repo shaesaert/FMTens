@@ -1,6 +1,6 @@
 import numpy as np
 from src.dfa_tree import *
-from src.Translate import *
+from src.translate import *
 import spot
 
 

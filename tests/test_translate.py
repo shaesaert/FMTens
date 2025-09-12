@@ -1,4 +1,4 @@
-from src.Translate import *
+from src.translate import *
 import spot
 
 def test_until():
