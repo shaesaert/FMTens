@@ -1,135 +1,143 @@
-import numpy as np
-from numpy.random import multivariate_normal
+# -*- coding: utf-8 -*-
+# linmodel.py
+# Definition of LinModel class in Python
 
+from __future__ import annotations
+from dataclasses import dataclass, field
+from typing import Optional, Tuple, List, Any
+import numpy as np
+
+Array = np.ndarray
+
+@dataclass
 class LinModel:
     """
-    LINMODEL Class of LTI systems with noise on the transitions.
-    Defines a model with dynamics:
-        x(t+1) = A x(t) + B u(t) + Bw w(t)
-        y(t)   = C x(t)
-    with w(t) ~ N(mu, sigma)
+    Python version of LinModel: LTI system with additive Gaussian noise
+
+      x(k+1) = A x(k) + B u(k) + Bw w(k)
+      y(k)   = C x(k) + D u(k)
+
+    where w(k) ~ N(mu, sigma)
     """
 
-    def __init__(self, A, B, C, D, Bw, *args):
-        self.type = "LTI"  # Type of model
-        self.A = np.array(A)
-        self.B = np.array(B)
-        self.C = np.array(C)
-        self.D = np.array(D)
-        self.Bw = np.array(Bw)
-        self.dim = self.Bw.shape[0]
+    # --- required matrices ---
+    A: Array
+    B: Array
+    C: Array
+    D: Array
+    Bw: Array
 
-        # Initialize optional attributes
-        self.mu = None
-        self.sigma = None
-        self.wsupport = None
-        self.X = None
-        self.U = None
-        self.regions = None
-        self.AP = None
-        self.MOR = False
-        self.P = None
-        self.Q = None
-        self.original = None
-        self.KKfilter = False
-        self.InitState = None
-        self.Xdare = None
-        self.K = None
-        self.Cobs = None
+    # --- noise parameters ---
+    mu: Optional[Array] = None
+    sigma: Optional[Array] = None
+    wsupport: Optional[Array] = None
+    dim: Optional[int] = None
 
-        # Parse arguments
-        if len(args) == 0:
-            raise ValueError("LinModel requires at least 5 arguments.")
-        elif len(args) == 1 and len(args[0]) >= 2:
-            # Bounded uniform distribution
-            self.set_wsupport(np.array(args[0]))
-        elif len(args) == 2:
-            # Unbounded Gaussian distribution
-            self.mu = np.array(args[0])
-            self.sigma = np.array(args[1])
-            self.set_wsupport(np.array([[-np.inf, np.inf]]))
-        elif len(args) == 3:
-            # Bounded Gaussian distribution
-            self.mu = np.array(args[0])
-            self.sigma = np.array(args[1])
-            self.set_wsupport(np.array(args[2]))
+    # --- additional attributes (placeholders for extension) ---
+    type: str = "LTI"
+    X: Any = None
+    U: Any = None
+    regions: Optional[List[Any]] = field(default_factory=list)
+    AP: Optional[List[Any]] = field(default_factory=list)
+
+    MOR: bool = False
+    P: Optional[Array] = None
+    Q: Optional[Array] = None
+    original: Optional["LinModel"] = None
+
+    KKfilter: bool = False
+    InitState: Optional[Tuple[Array, Array]] = None
+    Xdare: Optional[Array] = None
+    K: Optional[Array] = None
+    Cobs: Optional[Array] = None
+
+    def __post_init__(self):
+        # Convert to numpy arrays
+        self.A = np.atleast_2d(np.array(self.A, dtype=float))
+        self.B = np.atleast_2d(np.array(self.B, dtype=float))
+        self.C = np.atleast_2d(np.array(self.C, dtype=float))
+        self.D = np.atleast_2d(np.array(self.D, dtype=float))
+        self.Bw = np.atleast_2d(np.array(self.Bw, dtype=float))
+
+        n_x = self.A.shape[0]
+        if self.dim is None:
+            self.dim = int(self.Bw.shape[0])  # consistent with MATLAB: dim = size(Bw,1)
+        assert self.dim == n_x, "dim must match state dimension (rows of A)."
+
+        # Handle noise parameters
+        if self.mu is not None:
+            self.mu = np.array(self.mu, dtype=float).reshape(-1, 1)
+            n_w = self.mu.shape[0]
+            if self.sigma is None:
+                self.sigma = np.eye(n_w)
+            else:
+                self.sigma = np.array(self.sigma, dtype=float)
+                assert self.sigma.shape == (n_w, n_w), "sigma must be (n_w, n_w)."
+
+            if self.wsupport is None:
+                self.wsupport = np.hstack([
+                    -np.inf * np.ones((n_w, 1)),
+                    +np.inf * np.ones((n_w, 1))
+                ])
+            else:
+                self.wsupport = self._normalize_wsupport(self.wsupport, n_w)
+
+        elif self.wsupport is not None:
+            n_w = self.Bw.shape[1]
+            self.wsupport = self._normalize_wsupport(self.wsupport, n_w)
         else:
-            raise ValueError("Unsupported arguments for calling LinModel.")
+            # default: deterministic (w=0)
+            self.mu = np.zeros((self.Bw.shape[1], 1))
+            self.sigma = np.zeros((self.Bw.shape[1], self.Bw.shape[1]))
+            self.wsupport = np.hstack([
+                -np.inf * np.ones((self.Bw.shape[1], 1)),
+                +np.inf * np.ones((self.Bw.shape[1], 1))
+            ])
 
-    def f_det(self, x, u):
-        """
-        Computes the deterministic next state:
-            x(t+1) = A x(t) + B u(t)
-        """
-        x = np.array(x)
-        u = np.array(u)
+    @staticmethod
+    def _normalize_wsupport(wsupport: Array, n_w: int) -> Array:
+        W = np.array(wsupport, dtype=float)
+        if W.ndim == 1:
+            W = W.reshape(1, -1)
+        assert W.shape[1] == 2, "wsupport must have two columns"
+        if W.shape[0] == 1 and n_w != 1:
+            W = np.repeat(W, n_w, axis=0)
+        assert W.shape[0] == n_w, "wsupport rows must match noise dimension n_w"
+        return W
+
+    # ---------- system dynamics ----------
+    def f_det(self, x: Array, u: Array) -> Array:
+        """Deterministic update: x+ = A x + B u"""
+        x = np.atleast_2d(np.array(x, dtype=float))
+        u = np.atleast_2d(np.array(u, dtype=float))
         return self.A @ x + self.B @ u
 
-    def f_stoch(self, x, u, w=None):
+    def f_stoch(self, x: Array, u: Array, w: Optional[Array] = None):
         """
-        Computes the stochastic next state:
-            x(t+1) = A x(t) + B u(t) + Bw w(t)
-        If w is not provided, samples from N(mu, sigma).
-        Returns (x_next, w).
+        Stochastic update: x+ = A x + B u + Bw w
+        If w is None, sample from N(mu, sigma).
+        Returns (x_next, w_used).
         """
-        x = np.array(x)
-        u = np.array(u)
+        x = np.atleast_2d(np.array(x, dtype=float))
+        u = np.atleast_2d(np.array(u, dtype=float))
 
         if w is None:
-            w = multivariate_normal(self.mu, self.sigma)
+            if self.sigma is None or self.mu is None:
+                w = np.zeros((self.Bw.shape[1], 1))
+            else:
+                w = np.random.multivariate_normal(
+                    mean=self.mu.ravel(),
+                    cov=self.sigma,
+                    size=1
+                ).reshape(-1, 1)
         else:
-            w = np.array(w)
+            w = np.atleast_2d(np.array(w, dtype=float))
 
         x_next = self.A @ x + self.B @ u + self.Bw @ w
         return x_next, w
 
-    def simulate(self, x0, U, steps=None, stochastic=True, random_seed=None):
-        """
-        Simulates the system trajectory.
-        Args:
-            x0 : initial state (vector)
-            U : sequence of inputs (list/array of vectors)
-            steps : number of simulation steps (defaults to len(U))
-            stochastic : if True, include noise; otherwise deterministic
-            random_seed : seed for reproducibility
-        Returns:
-            X : array of states (steps+1, dim)
-            W : array of noises (steps, noise_dim) if stochastic, else zeros
-        """
-        if random_seed is not None:
-            np.random.seed(random_seed)
-
-        x0 = np.array(x0).flatten()
-        steps = steps or len(U)
-        noise_dim = self.Bw.shape[1]
-
-        X = np.zeros((steps + 1, self.dim))
-        W = np.zeros((steps, noise_dim))
-        X[0, :] = x0
-
-        for t in range(steps):
-            u = np.array(U[t]).flatten()
-            if stochastic:
-                x_next, w = self.f_stoch(X[t], u)
-                W[t, :] = w
-            else:
-                x_next = self.f_det(X[t], u)
-            X[t + 1, :] = x_next
-
-        return X, W
-
-    def set_wsupport(self, wsupport):
-        """
-        Sets noise support.
-        """
-        wsupport = np.array(wsupport)
-        if wsupport.shape[1] != 2:
-            raise ValueError("Invalid noise support.")
-
-        if wsupport.shape[0] == 1 and wsupport.shape[0] != self.dim:
-            # Copy support for all dimensions
-            self.wsupport = np.tile(wsupport, (self.dim, 1))
-        elif wsupport.shape[0] == self.dim:
-            self.wsupport = wsupport
-        else:
-            raise ValueError("Invalid noise support.")
+    def output(self, x: Array, u: Array) -> Array:
+        """Output: y = C x + D u"""
+        x = np.atleast_2d(np.array(x, dtype=float))
+        u = np.atleast_2d(np.array(u, dtype=float))
+        return self.C @ x + self.D @ u
