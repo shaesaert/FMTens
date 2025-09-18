@@ -1,320 +1,423 @@
+# dfa_tree_r1.py
 import numpy as np
 import networkx as nx
-from scipy.sparse import csr_matrix
-import matplotlib.pyplot as plt
+from scipy.sparse import csr_matrix, issparse
 from typing import List, Dict, Any, Optional, Tuple, Union
 
 
 class DFATree:
     """
-    Python translation of MATLAB dfa_tree_r1 class
+    DFA tree assuming a 0-based DFA:
+      - DFA.S == [0,1,...,nq-1]
+      - DFA.F (accepting) and optional DFA.sink are 0-based ints
+      - DFA.trans has shape (|S|, |act|) with 0-based target states
 
-    A class for handling DFA (Deterministic Finite Automaton) trees with value functions
-    for control synthesis and verification.
+    Internal graph node ids are 0-based:
+      - root node = 0 (accepting mode)
+      - children are added as 1, 2, ...
     """
 
-    def __init__(self, DFA, sysAbs, pol, nx, L):
-        """
-        Constructor for DFATree
-
-        Args:
-            DFA: DFA object with properties S, trans, F, sink, act
-            sysAbs: System abstraction (list of objects with P property)
-            pol: Policy
-            nx: List of state dimensions for each system
-            L: Labeling function (list of matrices)
-        """
+    # ---------- construction ----------
+    def __init__(self, DFA, sysAbs, pol, nx_list, L):
         self.DFA = DFA
-        self.sysAbs = sysAbs
-        self.L = L
-        self.nx = nx
-        self.dim = len(sysAbs)
-        self.pol = pol
 
-        # Validate DFA.S
-        if not np.array_equal(DFA.S, list(range(1, len(DFA.S) + 1))):
-            raise ValueError('DFA.S must contain a range starting from 1')
+        # Normalize sysAbs / nx / L to aligned lists (allow dicts keyed 0..D-1)
+        if isinstance(sysAbs, dict):
+            self.dim_keys = sorted(sysAbs.keys())
+            self.sysAbs = [sysAbs[k] for k in self.dim_keys]
+        else:
+            self.dim_keys = list(range(len(sysAbs)))
+            self.sysAbs = list(sysAbs)
 
-        # Initialize data structures
-        self.Q = {q: [] for q in DFA.S}  # Dictionary for DFA modes
-        self.Pxx = [[None for _ in range(self.dim)] for _ in range(len(DFA.S))]
-        self.V = [None for _ in range(self.dim)]  # Value function
+        if isinstance(nx_list, dict):
+            self.nx = [nx_list[k] for k in self.dim_keys]
+        else:
+            self.nx = list(nx_list)
 
-        self.tree = None
-        self.leafs = []
+        if isinstance(L, dict):
+            self.L = [L[k] for k in self.dim_keys]
+        else:
+            self.L = list(L)
 
-    def update_Pxx(self, new_Pxx):
-        """Update Pxx dynamically"""
-        self.Pxx = new_Pxx
-        print('Updated Pxx')
+        self.dim = len(self.sysAbs)
+        self.pol = pol  # pol[q][d] is (N, nu) dense or csr one-hot
 
-    def initiate(self):
-        """Create tree with accepting node and its children"""
-        # Find transitions to accepting state
-        trans_indices = np.where(self.DFA.trans == self.DFA.F)
-        S = trans_indices[0] + 1  # MATLAB uses 1-based indexing
-        l = trans_indices[1] + 1
+        # Validate DFA is 0-based, consecutive
+        S = list(np.asarray(DFA.S).ravel())
+        if not (min(S) == 0 and max(S) == len(S) - 1 and len(set(S)) == len(S)):
+            raise ValueError(f"DFA.S must be 0..|S|-1 (0-based consecutive). Got: {S}")
 
-        # Create initial tree structure
+        # Per-DFA-state controlled transitions (computed lazily)
+        self.Pxx: List[List[Optional[np.ndarray]]] = [
+            [None for _ in range(self.dim)] for _ in range(len(DFA.S))
+        ]
+
+        # Value tables per dimension (rows indexed by graph node id)
+        self.V: List[np.ndarray] = [np.zeros((0, self.nx[d])) for d in range(self.dim)]
+
+        # Graph + bookkeeping
+        self.tree: nx.DiGraph = nx.DiGraph()
+        self.leafs: List[int] = []
+        self.Q: Dict[int, List[int]] = {int(q): [] for q in DFA.S}  # DFA state q -> list of node ids
+
+    # ---------- helpers ----------
+    def Lq(self, n: int) -> int:
+        """Return DFA state (0-based) stored on node n."""
+        return int(self.tree.nodes[n]["q"])
+
+    def _nu_of_dim(self, d: int) -> int:
+        """Number of actions for dimension d inferred from flat transition shape."""
+        P_flat = np.asarray(getattr(self.sysAbs[d], "P"), dtype=float)  # (N, N*nu)
+        N, NU = P_flat.shape
+        if NU % N != 0:
+            raise ValueError(f"P must be (N, N*nu); got {P_flat.shape}")
+        return NU // N
+
+    def _as_dense_policy(self, q: int, d: int) -> np.ndarray:
+        """Return pol[q][d] as dense (N,nu). If None, uniform."""
+        N = self.nx[d]
+        nu = self._nu_of_dim(d)
+        P = self.pol[q][d]
+        if P is None:
+            return np.full((N, nu), 1.0 / nu, dtype=float)
+        if issparse(P):
+            arr = P.toarray()
+        else:
+            arr = np.asarray(P, dtype=float)
+        if arr.shape != (N, nu):
+            raise ValueError(f"policy shape incompatible: got {arr.shape}, need ({N},{nu})")
+        return arr
+
+    # ---------- initialization ----------
+    def initiate(self) -> "DFATree":
+        """
+        Build the initial tree:
+          - node 0 is the accepting mode (q = DFA.F)
+          - its children are all predecessors (s, l) such that trans[s, l] == F
+        Initialize V with root rows set to 1 (per dimension), others 0.
+        """
+        F = int(self.DFA.F)
+        trans = np.asarray(self.DFA.trans, dtype=int)
+
+        # Add root
         self.tree = nx.DiGraph()
+        self.tree.add_node(0, q=F)
 
-        # Add root node (accepting state)
-        self.tree.add_node(1, q=self.DFA.F)
-
-        # Add child nodes and edges
-        node_counter = 2
+        # Add all predecessors of F as children of root
+        S_rows, L_cols = np.where(trans == F)  # 0-based (sources s, letters l)
+        nid = 1
         self.leafs = []
+        for s, l in zip(S_rows, L_cols):
+            self.tree.add_node(nid, q=int(s))
+            self.tree.add_edge(0, nid, l=int(l))  # store label as 0-based column index
+            self.leafs.append(nid)
+            nid += 1
 
-        for i, (source_state, label) in enumerate(zip(S, l)):
-            self.tree.add_node(node_counter, q=source_state)
-            self.tree.add_edge(1, node_counter, l=label)
-            self.leafs.append(node_counter)
-            node_counter += 1
-
-        # Initialize value function
-        num_nodes = len(self.tree.nodes)
+        # Initialize value tables: root row = 1, others = 0
+        n_nodes = self.tree.number_of_nodes()
         for d in range(self.dim):
-            self.V[d] = np.zeros((num_nodes, self.nx[d]))
-            self.V[d][0, :] = 1  # Set accepting node value to 1
+            self.V[d] = np.zeros((n_nodes, self.nx[d]), dtype=float)
+            self.V[d][0, :] = 1.0
 
-        # Update Q mapping
-        self.Q[self.DFA.F] = [1]  # Add accepting node
+        # Build Q-mapping
+        self.Q = {int(q): [] for q in self.DFA.S}
+        self.Q[F].append(0)
         for n in self.leafs:
-            q = self.tree.nodes[n]['q']
-            self.Q[q].append(n)
+            self.Q[self.Lq(n)].append(n)
 
-    def Lq(self, n):
-        """Get the DFA state associated with tree node n"""
-        return self.tree.nodes[n]['q']
+        return self
 
-    def grow(self, *args):
-        """Add children to leafs of graph"""
-        leafs_old = self.leafs.copy()
-
-        if len(args) >= 2 and args[0] == 'number':
-            # Take n largest possible values
-            values = []
+    # ---------- growth ----------
+    def grow(self, *args) -> None:
+        """
+        Expand all current leaves.
+        Optionally: grow('number', k) -> only expand top-k leaves ranked by product of max V across dims.
+        """
+        leafs_old = list(self.leafs)
+        if len(args) >= 2 and args[0] == "number":
+            k = int(args[1])
+            scores = []
             for leaf in self.leafs:
-                prod_val = 1
+                s = 1.0
                 for d in range(self.dim):
-                    prod_val *= np.max(self.V[d][leaf, :])
-                values.append(prod_val)
-
-            sorted_indices = np.argsort(values)[::-1]  # Descending order
-            nmax = min(args[1], len(leafs_old))
-            leafs_old = [self.leafs[i] for i in sorted_indices[:nmax]]
+                    s *= float(np.max(self.V[d][leaf, :]))
+                scores.append(s)
+            order = np.argsort(scores)[::-1]
+            leafs_old = [self.leafs[i] for i in order[: min(k, len(order))]]
 
         for n in leafs_old:
             self.growleaf(n)
 
-    def growleaf(self, n):
-        """Grow a single leaf node"""
+    def growleaf(self, n: int) -> None:
+        """Expand a single leaf by adding all its DFA predecessors as children."""
         if n not in self.leafs:
-            raise ValueError('node is not a leaf node')
+            raise ValueError("node is not a leaf node")
 
-        maxnode = max(self.tree.nodes) if self.tree.nodes else 0
-        q = self.Lq(n)
+        q1 = self.Lq(n)
+        trans = np.asarray(self.DFA.trans, dtype=int)
 
-        # Find possible children
-        trans_indices = np.where(self.DFA.trans == q)
-        S = trans_indices[0] + 1  # Source states
-        l = trans_indices[1] + 1  # Labels
+        # All predecessors of q1: pairs (s, l) with trans[s,l] == q1
+        S_rows, L_cols = np.where(trans == q1)
 
-        # Add nodes and edges
+        # Append children
+        maxnode = self.tree.number_of_nodes() - 1
         new_nodes = []
-        for i, (source_state, label) in enumerate(zip(S, l)):
-            new_node = maxnode + i + 1
-            self.tree.add_node(new_node, q=source_state)
-            self.tree.add_edge(n, new_node, l=label)
-            new_nodes.append(new_node)
+        for i, (s, l) in enumerate(zip(S_rows, L_cols)):
+            nid = maxnode + i + 1
+            self.tree.add_node(nid, q=int(s))
+            self.tree.add_edge(n, nid, l=int(l))   # 0-based label column
+            new_nodes.append(nid)
 
-        # Update leafs
+        # Update leaf set
         self.leafs.remove(n)
         self.leafs.extend(new_nodes)
 
-        # Extend value function
+        # Extend value tables to accommodate new nodes (rows index == node ids)
         for d in range(self.dim):
-            new_rows = np.zeros((len(new_nodes), self.nx[d]))
-            self.V[d] = np.vstack([self.V[d], new_rows])
+            self.V[d] = np.vstack([self.V[d], np.zeros((len(new_nodes), self.nx[d]))])
 
         # Update Q mapping
-        for new_node in new_nodes:
-            q = self.Lq(new_node)
-            self.Q[q].append(new_node)
+        for nid in new_nodes:
+            self.Q[self.Lq(nid)].append(nid)
 
-    def update_node_value(self, n):
-        """Update value function for a specific node"""
-        if n == 1:  # Root node
+    # ---------- dynamic programming ----------
+    def update_node_value(self, n: int) -> None:
+        """
+        One child->parent propagation step for node n (skip root).
+        v_child(x) = L[l](x) * ( v_parent @ Pxx[q] )(x)
+        """
+        if n == 0:
+            return
+        parents = list(self.tree.predecessors(n))
+        if not parents:
             return
 
-        # Find parent node
-        predecessors = list(self.tree.predecessors(n))
-        if not predecessors:
-            return
-
-        nparent = predecessors[0]
-        edge_data = self.tree.edges[nparent, n]
-        l = edge_data['l'] - 1  # Convert to 0-based indexing
+        p = parents[0]
+        l = int(self.tree.edges[p, n]["l"])  # 0-based label column
+        q = self.Lq(n)                        # DFA mode at node n (0-based)
 
         for d in range(self.dim):
-            self.V[d][n, :] = (self.L[d][l, :] * self.V[d][nparent, :]) @ self.Pxx[self.Lq(n) - 1][d]
+            # Lazily compute Pxx for this DFA mode & dimension from current policy
+            if self.Pxx[q][d] is None:
+                self.Pxx[q][d] = self.Pc(self.sysAbs[d], self.pol[q][d])
 
-    def Q_n(self, n):
-        """Compute Q-values for node n"""
-        Vxa = [None for _ in range(self.dim)]
+            v_parent = self.V[d][p, :]                     # (N,)
+            mask = self.L[d][l, :].astype(float)           # (N,)
+            self.V[d][n, :] = (mask * v_parent) @ self.Pxx[q][d]
 
-        # Find parent node
-        predecessors = list(self.tree.predecessors(n))
-        if not predecessors:
-            return Vxa
-
-        nparent = predecessors[0]
-        edge_data = self.tree.edges[nparent, n]
-        l = edge_data['l'] - 1  # Convert to 0-based indexing
-
-        for d in range(self.dim):
-            Vxa[d] = (self.L[d][l, :] * self.V[d][nparent, :]) @ self.sysAbs[d].P
-
-        return Vxa
-
-    def update_tree(self):
-        """Update value function for all nodes in the tree"""
-        nodes = sorted(self.tree.nodes, reverse=True)
-        for n in nodes[:-1]:  # Skip root node
+    def update_tree(self) -> None:
+        """Propagate values deepest→root, skipping the root itself."""
+        for n in sorted(self.tree.nodes, reverse=True):
+            if n == 0:
+                continue
             self.update_node_value(n)
 
-    def findSubtree(self, n, nodeIDs=None):
-        """Find all nodes in subtree rooted at n"""
-        if nodeIDs is None:
-            nodeIDs = []
+    # ---------- Q-values for policy improvement ----------
+    def Q_n(self, n: int) -> List[np.ndarray]:
+        """
+        Return per-dimension Q-tables for node n:
+        Q[d] has shape (N, nu) and column u is the masked value using block B_u.
+        """
+        parents = list(self.tree.predecessors(n))
+        if not parents:
+            return [np.zeros((self.nx[d], self._nu_of_dim(d))) for d in range(self.dim)]
+        p = parents[0]
+        l = int(self.tree.edges[p, n]["l"])                # 0-based
+        out: List[np.ndarray] = []
+        for d in range(self.dim):
+            N = self.nx[d]
+            P_flat = np.asarray(getattr(self.sysAbs[d], "P"), dtype=float)  # (N, N*nu)
+            nu = P_flat.shape[1] // N
+            blocks = P_flat.reshape(N, N, nu, order="C")
+            v_parent = self.V[d][p, :]                     # (N,)
+            mask = self.L[d][l, :].astype(float)           # (N,)
+            Q = np.zeros((N, nu), dtype=float)
+            for u in range(nu):
+                Bu = blocks[:, :, u]                       # (N,N)
+                Q[:, u] = mask * (v_parent @ Bu)           # (N,)
+            out.append(Q)
+        return out
 
-        successors = list(self.tree.successors(n))
-        for n_next in successors:
-            nodeIDs = self.findSubtree(n_next, nodeIDs)
+    def maxpolicy(self, rho: List[np.ndarray]) -> List[List[csr_matrix]]:
+        """
+        Greedy, per-DFA-state, per-dimension improvement (same structure as your MATLAB version).
+        Updates self.pol and self.Pxx for all q ∉ {F, sink}.
+        """
+        nq = len(self.DFA.S)
+        new_pol: List[List[csr_matrix]] = [[None for _ in range(self.dim)] for _ in range(nq)]
+        skip = {int(self.DFA.F)}
+        if hasattr(self.DFA, "sink") and getattr(self.DFA, "sink") is not None:
+            skip.add(int(self.DFA.sink))
 
-        nodeIDs.append(n)
-        return nodeIDs
-
-    def removeBranch(self, nodes):
-        """Remove branch starting from given nodes"""
-        nodeIDs = []
-        for n in nodes:
-            nodeIDs.extend(self.findSubtree(n, []))
-
-        nodeIDs = sorted(set(nodeIDs), reverse=True)  # Remove duplicates and sort descending
-
-        for n in nodeIDs:
-            self.tree.remove_node(n)
-            if n in self.leafs:
-                self.leafs.remove(n)
-
-            # Renumber leafs
-            self.leafs = [leaf - (leaf > n) for leaf in self.leafs]
-
-            # Update Q mappings
-            for q in self.DFA.S:
-                if n in self.Q[q]:
-                    self.Q[q].remove(n)
-                self.Q[q] = [node - (node > n) for node in self.Q[q]]
-
-            # Remove from value function
-            for d in range(self.dim):
-                self.V[d] = np.delete(self.V[d], n - 1, axis=0)  # Convert to 0-based indexing
-
-    def maxpolicy(self, rho):
-        """Compute maximum policy"""
-        pol = [[None for _ in range(self.dim)] for _ in range(len(self.DFA.S))]
-
-        for q in set(self.DFA.S) - {self.DFA.F, self.DFA.sink}:
-            Vxa = [0 for _ in range(self.dim)]
-
+        for q in set(self.DFA.S) - skip:
             if not self.Q[q]:
                 continue
 
+            Vxa = [np.zeros((self.nx[d], self._nu_of_dim(d)), dtype=float) for d in range(self.dim)]
             for n in self.Q[q]:
-                Qv = self.Q_n(n)
+                Qv = self.Q_n(n)  # List[(N,nu)]
 
-                # Compute constants for each dimension
-                c = np.zeros(self.dim)
+                # constants c[d]
+                c = np.zeros(self.dim, dtype=float)
                 for d in range(self.dim):
-                    c[d] = rho[d].T @ np.sum(Qv[d] * self.pol[q - 1][d], axis=1)
+                    pol_dense = self._as_dense_policy(q, d)     # (N,nu)
+                    vec = np.sum(Qv[d] * pol_dense, axis=1)     # (N,)
+                    c[d] = float(np.asarray(rho[d]).ravel() @ vec)
 
+                prod_c = np.prod(c) if self.dim > 0 else 1.0
                 for d in range(self.dim):
-                    other_dims = [i for i in range(self.dim) if i != d]
-                    Vxa[d] = Vxa[d] + Qv[d] * np.prod(c[other_dims])
+                    if self.dim == 1:
+                        scale = 1.0
+                    else:
+                        scale = (prod_c / c[d]) if c[d] != 0 else 0.0
+                    Vxa[d] += Qv[d] * scale
 
+            # Greedy per-dimension argmax -> one-hot; update Pxx
             for d in range(self.dim):
                 I = np.argmax(Vxa[d], axis=1)
-                pol[q - 1][d] = csr_matrix((np.ones(len(I)), (range(len(I)), I)),
-                                           shape=(Vxa[d].shape[0], Vxa[d].shape[1]))
-                self.Pxx[q - 1][d] = self.Pc(self.sysAbs[d].P, pol[q - 1][d])
+                rows = np.arange(self.nx[d])
+                onehot = csr_matrix((np.ones(self.nx[d]), (rows, I)),
+                                    shape=(self.nx[d], self._nu_of_dim(d)))
+                new_pol[q][d] = onehot
+                self.Pxx[q][d] = self.Pc(self.sysAbs[d], onehot)
 
-        self.pol = pol
-        print("Policy updated")
-        print(pol)
+        self.pol = new_pol
+        return new_pol
 
-        return pol
+    # ---------- pruning / relabeling ----------
+    def findSubtree(self, n: int, nodeIDs: Optional[List[int]] = None) -> List[int]:
+        """Collect all nodes in the subtree rooted at n (post-order)."""
+        if nodeIDs is None:
+            nodeIDs = []
+        for n_next in list(self.tree.successors(n)):
+            nodeIDs = self.findSubtree(n_next, nodeIDs)
+        nodeIDs.append(n)
+        return nodeIDs
 
-    def plot(self, *args):
-        """Plot the tree structure"""
-        plt.figure(figsize=(10, 8))
-        pos = nx.spring_layout(self.tree)
+    def removeBranch(self, nodes: List[int]) -> None:
+        """
+        Remove subtrees rooted at given nodes. After deletion, re-label the remaining
+        graph nodes to keep ids contiguous (0..N-1) and keep V/Q/leafs in sync.
+        """
+        # 1) collect nodes to delete
+        to_delete: List[int] = []
+        for n in nodes:
+            to_delete = list(set(to_delete).union(self.findSubtree(n, [])))
 
-        # Draw nodes with labels
-        node_labels = {n: self.tree.nodes[n]['q'] for n in self.tree.nodes}
+        # 2) delete from graph
+        for n in sorted(to_delete, reverse=True):
+            if n in self.tree:
+                self.tree.remove_node(n)
+
+        # 3) relabel remaining nodes to 0..N-1
+        remaining = sorted(list(self.tree.nodes))
+        mapping = {old: new for new, old in enumerate(remaining)}
+        nx.relabel_nodes(self.tree, mapping, copy=False)
+
+        # 4) rebuild leafs and Q using new ids
+        self.leafs = [mapping[leaf] for leaf in self.leafs if leaf in mapping]
+        new_Q = {int(q): [] for q in self.DFA.S}
+        for q, lst in self.Q.items():
+            new_Q[q] = [mapping[n] for n in lst if n in mapping]
+        self.Q = new_Q
+
+        # 5) rebuild V rows in new order
+        for d in range(self.dim):
+            old_V = self.V[d]
+            new_V = np.zeros((len(remaining), self.nx[d]), dtype=float)
+            for old in remaining:
+                new = mapping[old]
+                new_V[new, :] = old_V[old, :]
+            self.V[d] = new_V
+
+    # ---------- plotting ----------
+    def plot(self, use_letters: bool = False) -> None:
+        import matplotlib.pyplot as plt
+        pos = nx.spring_layout(self.tree, seed=0)
         nx.draw_networkx_nodes(self.tree, pos)
-        nx.draw_networkx_labels(self.tree, pos, node_labels)
-        nx.draw_networkx_edges(self.tree, pos)
-
-        # Draw edge labels
-        if len(args) >= 1 and args[0] == 'letters':
-            edge_labels = {}
-            for u, v, data in self.tree.edges(data=True):
-                edge_labels[(u, v)] = self.DFA.act[data['l'] - 1]  # Convert to 0-based
+        nx.draw_networkx_labels(self.tree, pos, {n: self.tree.nodes[n]["q"] for n in self.tree.nodes})
+        nx.draw_networkx_edges(self.tree, pos, arrows=True)
+        if use_letters and hasattr(self.DFA, "act"):
+            elabs = {(u, v): self.DFA.act[self.tree.edges[u, v]["l"]] for (u, v) in self.tree.edges}
         else:
-            edge_labels = {(u, v): data['l'] for u, v, data in self.tree.edges(data=True)}
-
-        nx.draw_networkx_edge_labels(self.tree, pos, edge_labels)
+            elabs = {(u, v): self.tree.edges[u, v]["l"] for (u, v) in self.tree.edges}
+        nx.draw_networkx_edge_labels(self.tree, pos, elabs, font_size=9)
+        plt.axis("off")
         plt.show()
 
-    def prune(self, tol, *args):
-        """Prune nodes with low values"""
-        if len(args) >= 1 and args[0] == 'leafs':
-            # Only consider leaf nodes
-            values = []
-            for leaf in self.leafs:
-                prod_val = 1
-                for d in range(self.dim):
-                    prod_val *= np.max(self.V[d][leaf, :])
-                values.append(prod_val)
+    # ---------- Pc (controlled transitions) ----------
+    @staticmethod
 
-            idx = [i for i, val in enumerate(values) if val < tol]
-            nodeids = [self.leafs[i] for i in idx]
+    def Pc(sys_or_P: Union[Any, np.ndarray],
+           pol: Union[np.ndarray, csr_matrix],
+           *,
+           return_container: bool = False):
+        """
+        MATLAB-equivalent 'Pc':
+          Plarge = P_flat .* vec(pol)'   (vec is column-major)
+          PC     = sum_u Plarge[:, u*N : (u+1)*N]
+
+        Inputs
+        ------
+        sys_or_P : object with one of {P_det, Prob, P} shaped (N, N*nu), or a flat ndarray (N, N*nu)
+        pol      : (N, nu) dense or CSR policy (one-hot or stochastic)
+        return_container : if True and sys_or_P is an object, return a shallow copy with the chosen
+                           source field (P_det/Prob/P) replaced by the N×N controlled matrix. Otherwise
+                           return the N×N ndarray (default, recommended for DFATree use).
+
+        Returns
+        -------
+        PC : (N, N) ndarray if return_container=False
+             or a container with .P_det / .Prob / .P replaced by PC when return_container=True.
+        """
+        # --- pick the source flat matrix in this priority: P_det -> Prob -> P ---
+        src_name = None
+        if isinstance(sys_or_P, np.ndarray):
+            S = np.asarray(sys_or_P, dtype=float)          # (N, N*nu)
         else:
-            # Consider all nodes
-            nodeids = []
-            for n in self.tree.nodes:
-                prod_val = 1
-                for d in range(self.dim):
-                    prod_val *= np.max(self.V[d][n - 1, :])  # Convert to 0-based
-                if prod_val < tol:
-                    nodeids.append(n)
+            for name in ("P_det", "Prob", "P"):
+                if hasattr(sys_or_P, name):
+                    S = np.asarray(getattr(sys_or_P, name), dtype=float)
+                    src_name = name
+                    break
+            else:
+                raise ValueError("Pc: sys_or_P must be ndarray or have one of fields: P_det, Prob, P.")
 
-        if nodeids:
-            print(f'Pruning nodeids = {nodeids}')
-            self.removeBranch(nodeids)
+        N, NU = S.shape
+        if NU % N != 0:
+            raise ValueError(f"Pc: expected flat shape (N, N*nu). Got {S.shape}.")
+        nu = NU // N
 
+        # --- policy -> dense (N, nu) ---
+        if issparse(pol):
+            pol_dense = pol.toarray()
+        else:
+            pol_dense = np.asarray(pol, dtype=float)
+        if pol_dense.shape != (N, nu):
+            raise ValueError(f"Pc: policy must be shape (N,{nu}), got {pol_dense.shape}.")
+
+        # --- MATLAB's vec(pol) is column-major (Fortran) ---
+        w = np.reshape(pol_dense, (N * nu,), order="F")    # length N*nu
+
+        # --- Plarge = S .* w' (column-wise scaling) ---
+        Plarge = S * w[None, :]                            # (N, N*nu)
+
+        # --- Sum N-wide blocks across actions ---
+        PC = np.zeros((N, N), dtype=float)
+        for u in range(nu):
+            PC += Plarge[:, u * N : (u + 1) * N]
+
+        if return_container and not isinstance(sys_or_P, np.ndarray):
+            # Shallow copy with updated field (MATLAB style)
+            out = type(sys_or_P).__new__(type(sys_or_P))
+            out.__dict__.update(sys_or_P.__dict__)
+            setattr(out, src_name, PC)
+            return out
+
+        return PC
+
+    # ---------- label helper ----------
     @staticmethod
-    def Pc(P, pol):
-        """Compute policy-controlled transition matrix (needs implementation)"""
-        # This function needs to be implemented based on the specific requirements
-        # It should return a matrix based on the transition matrix P and policy pol
-        raise NotImplementedError("Pc function needs to be implemented")
-
-    @staticmethod
-    def num2label(act, nodes_l):
-        """Convert numeric labels to AP based labels"""
-        letters = []
-        for q in range(len(nodes_l)):
-            letters.append(act[nodes_l[q] - 1])  # Convert to 0-based indexing
-        return letters
+    def num2label(act: List[str], nodes_l: List[int]) -> List[str]:
+        """Map label indices (0-based) to strings."""
+        return [act[i] for i in nodes_l]

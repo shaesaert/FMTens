@@ -3,19 +3,18 @@ import polytope as pc
 from importlib import reload
 
 from src.models.linmodel import LinModel
-# USE FOLLOWING LINES IF CHANGES ARE MADE IN 'src.models.mdpmodel'
-# import src.models.mdpmodel as MDPModel_mod
-# reload(MDPModel_mod)
 from src.models.mdpmodel import MDPModel
 from src.specifications.translate import translate
 from src.specifications.utils.dfa_tool import dfa_manipulation
-# USE FOLLOWING LINES IF CHANGES ARE MADE IN 'src.abstraction.utils.labeling'
-# import src.abstraction.utils.labeling as dim_label_mod
-# reload(dim_label_mod)
 from src.abstraction.utils.labeling import dim_label
+# -----------------------
+# TODO@Ruohan: DFATree under construction
+import src.dynprog.dfa_tree_r1 as DFATree_mod
+reload(DFATree_mod)
+from src.dynprog.dfa_tree_r1 import DFATree
+# -----------------------
+from src.vis.dfa_tree_viz import plot_tree_layered
 
-#TODO@Ruohan:
-# from src.dynprog import dfa_tree_r1
 
 # -----------------------
 # Continuous system (2 dimensions, each 1D)
@@ -95,13 +94,13 @@ L = dim_label(sysAbs, sysLTI, letters, visualize=True)
 # -----------------------
 # Tree
 # -----------------------
-# TODO@Ruohan: 1) initialize randomized policy                      DONE
-#              2) uniform approximation weighting (for policy op)   DONE
-#              3) initialize tree
+# TODO@Ruohan: 1) initialize randomized policy                      status: DONE, checked
+#              2) uniform approximation weighting (for policy op)   status: DONE, checked
+#              3) initialize tree                                   status: DONE, checked
 #              4) begin of tree loop
-#               4.a) optimize policy
-#               4.b) update node value
-#               4.c) grow new leafs (children of previous leafs), assign 0
+#               4.a) optimize policy                                status: to be checked
+#               4.b) update node value                              status: to be checked
+#               4.c) grow new leafs (children of previous leafs)    status: DONE, checked
 
 # -----------------------
 # Policy (randomized uniform) & rho
@@ -120,6 +119,22 @@ pol = [
 
 # sampling rho: uniform over states in each dimension
 rho = [np.full(nx[d], 1.0/nx[d], dtype=float) for d in range(len(dims))]
+
+# initialize tree
+nx_list = [sysAbs[k].N for k in sorted(sysAbs.keys())]
+L_list  = [L[k]       for k in sorted(sysAbs.keys())]
+G = DFATree(DFA, sysAbs, pol, nx_list, L_list)
+G.initiate()
+plot_tree_layered(G)
+
+for it in range(3):
+    print(f"=== Iter {it+1} ===")
+    G.maxpolicy(rho)
+    G.update_tree()
+    plot_tree_layered(G)
+    G.grow()
+    plot_tree_layered(G)
+    print(f"[iter {it+1}] #nodes={G.tree.number_of_nodes()}  #leafs={len(G.leafs)}")
 
 
 # -----------------------
