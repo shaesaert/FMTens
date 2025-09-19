@@ -210,9 +210,8 @@ class DFATree:
             if self.Pxx[q][d] is None:
                 self.Pxx[q][d] = self.Pc(self.sysAbs[d], self.pol[q][d])
 
-            v_parent = self.V[d][p, :]                     # (N,)
-            mask = self.L[d][l, :].astype(float)           # (N,)
-            self.V[d][n, :] = (mask * v_parent) @ self.Pxx[q][d]
+            v_parent = self.V[d][p, :]                # (N,)
+            mask = self.L[d][l, :].astype(float)      # (N,)
 
             mask_row = np.asarray(mask).reshape(1, -1)  # (1, N)
             v_parent_row = np.asarray(v_parent).reshape(1, -1)  # (1, N)
@@ -238,6 +237,8 @@ class DFATree:
         Return per-dimension Q-tables for node n:
         Q[d] has shape (N, nu) and column u is the masked value using block B_u.
 
+        For node n with parent p via label l (0-based), we compute:
+            Q[:,u] = χ_l ⊙ (v_parent @ B_u)
         """
         parents = list(self.tree.predecessors(n))
         if not parents:
