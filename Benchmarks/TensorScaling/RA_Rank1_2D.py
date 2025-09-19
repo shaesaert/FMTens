@@ -2,10 +2,19 @@ import numpy as np
 import polytope as pc
 from importlib import reload
 
+import src.models.linmodel as LinModel_mod
+reload(LinModel_mod)
 from src.models.linmodel import LinModel
+
+import src.models.mdpmodel as mdpmodel_mod
+reload(mdpmodel_mod)
 from src.models.mdpmodel import MDPModel
+
 from src.specifications.translate import translate
 from src.specifications.utils.dfa_tool import dfa_manipulation
+
+import src.abstraction.utils.labeling as dim_label_mod
+reload(dim_label_mod)
 from src.abstraction.utils.labeling import dim_label
 # -----------------------
 # TODO@Ruohan: DFATree under construction
@@ -131,7 +140,6 @@ for it in range(3):
     print(f"=== Iter {it+1} ===")
     G.maxpolicy(rho)
     G.update_tree()
-    plot_tree_layered(G)
     G.grow()
     plot_tree_layered(G)
     print(f"[iter {it+1}] #nodes={G.tree.number_of_nodes()}  #leafs={len(G.leafs)}")

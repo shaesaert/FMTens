@@ -7,7 +7,24 @@ from dataclasses import dataclass, field
 from typing import Optional, Tuple, List, Any
 import numpy as np
 
+
 Array = np.ndarray
+
+
+# linmodel.py (add near the top-level helpers)
+def _as_col(a, n_expected: int | None = None) -> np.ndarray:
+    """Return a as a column vector (n,1). If it's (1,n_expected), transpose."""
+    arr = np.array(a, dtype=float, copy=False)
+    if arr.ndim == 1:
+        return arr.reshape(-1, 1)
+    if arr.ndim == 2:
+        # if given as a row (1, n_expected), flip to (n_expected, 1)
+        if arr.shape[0] == 1 and (n_expected is None or arr.shape[1] == n_expected):
+            return arr.T
+        return arr
+    # Fallback: flatten to column
+    return arr.reshape(-1, 1)
+
 
 @dataclass
 class LinModel:
@@ -50,6 +67,7 @@ class LinModel:
     Xdare: Optional[Array] = None
     K: Optional[Array] = None
     Cobs: Optional[Array] = None
+
 
     def __post_init__(self):
         # Convert to numpy arrays
@@ -107,19 +125,13 @@ class LinModel:
 
     # ---------- system dynamics ----------
     def f_det(self, x: Array, u: Array) -> Array:
-        """Deterministic update: x+ = A x + B u"""
-        x = np.atleast_2d(np.array(x, dtype=float))
-        u = np.atleast_2d(np.array(u, dtype=float))
+        x = _as_col(x, n_expected=self.A.shape[0])
+        u = _as_col(u, n_expected=self.B.shape[1])
         return self.A @ x + self.B @ u
 
     def f_stoch(self, x: Array, u: Array, w: Optional[Array] = None):
-        """
-        Stochastic update: x+ = A x + B u + Bw w
-        If w is None, sample from N(mu, sigma).
-        Returns (x_next, w_used).
-        """
-        x = np.atleast_2d(np.array(x, dtype=float))
-        u = np.atleast_2d(np.array(u, dtype=float))
+        x = _as_col(x, n_expected=self.A.shape[0])
+        u = _as_col(u, n_expected=self.B.shape[1])
 
         if w is None:
             if self.sigma is None or self.mu is None:
@@ -131,13 +143,13 @@ class LinModel:
                     size=1
                 ).reshape(-1, 1)
         else:
-            w = np.atleast_2d(np.array(w, dtype=float))
+            w = _as_col(w, n_expected=self.Bw.shape[1])
 
         x_next = self.A @ x + self.B @ u + self.Bw @ w
         return x_next, w
 
     def output(self, x: Array, u: Array) -> Array:
-        """Output: y = C x + D u"""
-        x = np.atleast_2d(np.array(x, dtype=float))
-        u = np.atleast_2d(np.array(u, dtype=float))
+        x = _as_col(x, n_expected=self.A.shape[0])
+        u = _as_col(u, n_expected=self.B.shape[1])
         return self.C @ x + self.D @ u
+

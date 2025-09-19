@@ -56,15 +56,15 @@ def _cartesian_from_axes(axes: List[Array]) -> Array:
 def _flat_from_blocks(P_blocks: Array) -> Array:
     """Convert (N, N, M) -> (N, N*M)."""
     N, _, M = P_blocks.shape
-    return P_blocks.reshape(N, N * M, order="C")
+    return P_blocks.reshape(N, N * M, order="F")
 
 
-def _blocks_from_flat(P_flat: Array, N: int) -> Array:
-    """Convert (N, N*M) -> (N, N, M)."""
+def _blocks_from_flat(P_flat: np.ndarray, N: int) -> np.ndarray:
+    """Convert (N, N*M) -> (N, N, M) using Fortran (column-major) layout."""
     if P_flat.shape[1] % N != 0:
         raise ValueError("P_flat second dimension is not a multiple of N.")
     M = P_flat.shape[1] // N
-    return P_flat.reshape(N, N, M, order="C")
+    return P_flat.reshape(N, N, M, order="F")
 
 
 @dataclass
@@ -242,40 +242,54 @@ class MDPModel:
     # =====================
     @staticmethod
     def _bbox_from_polytope(poly_or_bounds) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Return [lower, upper] bounds.
-        Accepts:
-          - polytope.Polytope
-          - (lower, upper) tuple/list/array, each (n,)
-          - array with shape (2, n) where row 0 = lower, row 1 = upper
-        """
         if poly_or_bounds is None:
             raise ValueError("Expected a Polytope or (lower, upper) bounds, got None.")
 
-        # tuple/list/array of bounds
+        # tuple/list of bounds
         if isinstance(poly_or_bounds, (tuple, list)):
             lower = np.asarray(poly_or_bounds[0], dtype=float).ravel()
             upper = np.asarray(poly_or_bounds[1], dtype=float).ravel()
             return lower, upper
 
         arr = np.asarray(poly_or_bounds)
+
+        # NEW: 1-D array with two entries -> treat as scalar bounds for 1-D
+        if arr.ndim == 1 and arr.size == 2:
+            lower = np.array([float(arr[0])])
+            upper = np.array([float(arr[1])])
+            return lower, upper
+
+        # 2×n array -> row 0 lower, row 1 upper
         if arr.ndim == 2 and arr.shape[0] == 2:
             lower = np.asarray(arr[0], dtype=float).ravel()
             upper = np.asarray(arr[1], dtype=float).ravel()
             return lower, upper
 
-        # assume polytope object
+        # Otherwise assume a polytope object
         V = np.asarray([np.asarray(v).ravel() for v in pc.extreme(poly_or_bounds)])
         lower = V.min(axis=0)
         upper = V.max(axis=0)
         return lower, upper
 
+    # --- in src/models/mdpmodel.py ---
+
     @staticmethod
     def _filter_points_in_poly(P, pts: Array, tol: float = 1e-9) -> Array:
-        """Keep only points inside polytope P using A x <= b (+ tolerance)."""
-        A = np.asarray(P.A, dtype=float)
-        b = np.asarray(P.b, dtype=float).reshape(-1, 1)
-        ok = (A @ pts.T <= b + tol).all(axis=0)
+        """Keep only points inside polytope P (A x <= b) or within axis-aligned bounds."""
+        # Polytope-like objects have A, b
+        if hasattr(P, "A") and hasattr(P, "b"):
+            A = np.asarray(P.A, dtype=float)
+            b = np.asarray(P.b, dtype=float).reshape(-1, 1)
+            ok = (A @ pts.T <= b + tol).all(axis=0)
+            return pts[ok]
+
+        # Otherwise treat P as bounds (tuple/list/array)
+        lower, upper = MDPModel._bbox_from_polytope(P)  # returns (n,) arrays
+        lower = np.asarray(lower, dtype=float).ravel()
+        upper = np.asarray(upper, dtype=float).ravel()
+
+        # pts is (N, n); works for n=1 too
+        ok = np.all((pts >= lower) & (pts <= upper + tol), axis=1)
         return pts[ok]
 
     @staticmethod

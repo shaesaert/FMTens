@@ -164,77 +164,123 @@ def plot_binary_matrix(mat, title="", row_labels=None, outfile=None,
 
 from typing import Union, Sequence, Dict, List, Optional, Tuple
 
-def dim_label(
-    sysAbs: Union[Dict[Union[int, str], object], Sequence[object]],
-    sysLTI: Union[Dict[Union[int, str], object], Sequence[object]],
-    letters: List[str],
-    *,
-    visualize: bool = False,
-    outfiles: Optional[Union[bool, str, Sequence[str]]] = None,
-    x_tick_step: Optional[int] = None,
-    show: bool = True,
-) -> List[np.ndarray]:
-    """
-    Build L[d] per dimension. Optionally visualize and/or save plots.
+# src/abstraction/utils/labeling.py
+import os
 
-    outfiles:
-      - None         -> don't save
-      - True         -> save as 'L{i}.png'
-      - 'pattern'    -> if contains '{i}' or '{idx}', format with the dim index
-                        e.g. 'plots/L{idx}.pdf'
-                        if no placeholder and multiple dims, auto-suffix:
-                        'pattern_0.png', 'pattern_1.png', ...
-      - [names...]   -> per-dim filenames (length ≥ #dims)
+# assume these helpers live in this same module/file as per your merge:
+# - _axis_from_hx
+# - _intervals_from_polytope_1d
+# - label_axis_by_letters
+# - plot_binary_matrix
+
+import numpy as np
+import polytope as pc
+
+def _axis_from_hx(hx):
+    """Return a 1D numpy array representing the (only) axis in hx."""
+    if isinstance(hx, (list, tuple)):
+        if len(hx) != 1:
+            raise ValueError(f"_axis_from_hx expected a single axis, got {len(hx)}")
+        return np.asarray(hx[0], dtype=float).ravel()
+    return np.asarray(hx, dtype=float).ravel()
+
+def intervals_from_polytope_1d(P, atol: float = 1e-12):
     """
-    # normalize to ordered keys
+    Convert a 1D H-polytope {x | A x <= b} into a list of closed intervals [(lo, hi)].
+    - Assumes a single connected interval (typical for your AP regions).
+    - If P is a list/tuple of polytopes, flattens and returns the union of intervals.
+    """
+    def _one(poly):
+        A = np.asarray(poly.A, dtype=float).reshape(-1, 1)
+        b = np.asarray(poly.b, dtype=float).ravel()
+        lo, hi = -np.inf, np.inf
+        for a, bb in zip(A.ravel(), b):
+            if abs(a) <= atol:
+                continue
+            bound = bb / a
+            if a > 0:   #  a*x <= b  ->  x <= b/a
+                hi = min(hi, bound)
+            else:       #  a*x <= b  ->  -|a|*x <= b -> x >= b/a
+                lo = max(lo, bound)
+        return [] if lo > hi else [(lo, hi)]
+
+    # support a union passed as list/tuple
+    if isinstance(P, (list, tuple)):
+        out = []
+        for poly in P:
+            out.extend(_one(poly))
+        return out
+    return _one(P)
+
+# keep backward compatibility with code that still calls the underscored name
+def _intervals_from_polytope_1d(P, atol: float = 1e-12):
+    return intervals_from_polytope_1d(P, atol=atol)
+
+
+def dim_label(sysAbs, sysLTI, letters, visualize=False, outdir=None, prefix="L"):
+    """
+    Build per-dimension label matrices.
+
+    Returns:
+      - dict keyed by dimension if sysAbs is a dict
+      - list in order if sysAbs is a list/tuple
+
+    L[d] has shape (len(letters), N_d).
+    """
+    # normalize keys and return type
     if isinstance(sysAbs, dict):
-        keys = list(sysAbs.keys())
+        keys = sorted(sysAbs.keys())
+        get_abs = lambda k: sysAbs[k]
+        get_lti = lambda k: sysLTI[k]
+        return_as_dict = True
     else:
         keys = list(range(len(sysAbs)))
-    nd = len(keys)
+        get_abs = lambda k: sysAbs[k]
+        get_lti = lambda k: sysLTI[k]
+        return_as_dict = False
 
-    # helper: resolve filename for dim i
-    def _resolve_name(i: int) -> Optional[str]:
-        if outfiles is None:
-            return None
-        if outfiles is True:
-            return f"L{i}.png"
-        if isinstance(outfiles, (list, tuple)):
-            if i < len(outfiles):
-                return outfiles[i]
-            # if shorter, fall back to default
-            return f"L{i}.png"
-        if isinstance(outfiles, str):
-            if ("{i}" in outfiles) or ("{idx}" in outfiles):
-                return outfiles.format(i=i, idx=i)
-            # single string with multiple dims -> auto suffix
-            if nd == 1:
-                return outfiles
-            # try to insert before extension
-            import os
-            root, ext = os.path.splitext(outfiles)
-            ext = ext or ".png"
-            return f"{root}_{i}{ext}"
-        return None
+    L_map = {}
 
-    L_list: List[np.ndarray] = []
+    # ensure output dir
+    if visualize and outdir is not None:
+        os.makedirs(outdir, exist_ok=True)
 
-    for pos, k in enumerate(keys):
-        mdp = sysAbs[k]
-        cont = sysLTI[k]
+    for k in keys:
+        mdp_k = get_abs(k)
+        lti_k = get_lti(k)
 
-        xax = axis_from_hx(mdp.hx)
-        aps_in_dim = set(cont.AP)
-        ap_regions = {ap: intervals_from_polytope_1d(reg)
-                      for ap, reg in zip(cont.AP, cont.regions)}
+        # 1) axis from hx
+        xax_k = _axis_from_hx(mdp_k.hx)
 
-        L = label_axis_by_letters(xax, letters, aps_in_dim, ap_regions).astype(float)
-        L_list.append(L)
+        # 2) AP sets and 1D region intervals
+        aps_set = set(getattr(lti_k, "AP", []))
+        regions = {ap: _intervals_from_polytope_1d(reg)
+                   for ap, reg in zip(getattr(lti_k, "AP", []),
+                                      getattr(lti_k, "regions", []))}
 
-        if visualize or outfiles is not None:
-            fname = _resolve_name(pos)
-            title = f"L[{pos}] (letters × x-grid)"
-            plot_binary_matrix(L.astype(int), title=title, row_labels=letters,
-                               outfile=fname, x_tick_step=x_tick_step, show=show)
+        # 3) label matrix for this dimension
+        Lk = np.asarray(
+            label_axis_by_letters(xax_k, letters, aps_set, regions),
+            dtype=float
+        )
+        L_map[k] = Lk
 
-    return L_list
+        # 4) optional visualization
+        if visualize:
+            fname = f"{prefix}{k}.png"
+            if outdir:
+                fname = os.path.join(outdir, fname)
+            # pick a light tick step
+            step = max(1, len(xax_k) // 10)
+            plot_binary_matrix(
+                Lk.astype(int),
+                title=f"L[{k}] (letters × x{k}-grid)",
+                row_labels=letters,
+                outfile=fname,
+                x_tick_step=step,
+            )
+
+    if return_as_dict:
+        return L_map
+    else:
+        return [L_map[k] for k in keys]
