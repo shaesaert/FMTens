@@ -1,10 +1,13 @@
 # dfa_tree_r1.py
 import copy
+from operator import index
 from typing import List, Dict, Any, Optional, Union
 
 import networkx as nx
 import numpy as np
+from fontTools.varLib.builder import VarData_CalculateNumShorts
 from scipy.sparse import csr_matrix, issparse
+from scipy import sparse
 
 
 class DFATree:
@@ -207,22 +210,19 @@ class DFATree:
             return
 
         for d in range(self.dim):
-            if self.Pxx[q][d] is None:
-                self.Pxx[q][d] = self.Pc(self.sysAbs[d], self.pol[q][d])
+            # if self.Pxx[q][d] is None:
+            #     self.Pxx[q][d] = self.Pc(self.sysAbs[d].P_flat, self.pol[q][d])
 
-            v_parent = self.V[d][p, :]                # (N,)
-            mask = self.L[d][l, :].astype(float)      # (N,)
+            v_parent = self.V[d][p, :]
+            v_parent_row = v_parent.reshape(1, -1)
 
-            mask_row = np.asarray(mask).reshape(1, -1)  # (1, N)
-            v_parent_row = np.asarray(v_parent).reshape(1, -1)  # (1, N)
+            mask = self.L[d][l, :].astype(float)     # (N,)
+            mask_row = mask.reshape(1, -1)  # (1, N)
 
-            # 2) elementwise multiply stays row-shaped
-            v_new_row = mask_row * v_parent_row  # (1, N)
+            elemul = v_parent_row * mask_row
+            vx = elemul @ self.Pxx[q][d]
 
-            # 3) row @ matrix -> row
-            out_row = v_new_row @ self.Pxx[q][d]  # (1, K)
-            out_1D = out_row.ravel()  # (K,) if you prefer 1-D
-            self.V[d][n, :] = out_1D
+            self.V[d][n, :] = vx.ravel()
 
     def update_tree(self) -> None:
         """Propagate values deepest→root, skipping the root itself."""
@@ -234,111 +234,106 @@ class DFATree:
     # ---------- Q-values for policy improvement ----------
     def Q_n(self, n: int) -> List[np.ndarray]:
         """
-        Return per-dimension Q-tables for node n:
-        Q[d] has shape (N, nu) and column u is the masked value using block B_u.
+        Return per-dimension arrays Vxa[d] with shape (N, nu), where
+        Vxa[d] = ( L[d](l,:) .* V[d](nparent,:) ) @ P_flat[d],
+        reshaped to (N, nu).
 
-        For node n with parent p via label l (0-based), we compute:
-            Q[:,u] = χ_l ⊙ (v_parent @ B_u)
+        If node n has no parent (e.g., the root), returns zeros of the
+        correct shapes for each dimension.
         """
+        # find parent and label l on edge (parent -> n)
         parents = list(self.tree.predecessors(n))
         if not parents:
-            # No parent: return correctly-shaped zeros for each dimension
+            # Root or detached: return zeros with correct shapes
             return [np.zeros((self.nx[d], self._nu_of_dim(d)), dtype=float)
                     for d in range(self.dim)]
 
-        p = parents[0]
-        l = int(self.tree.edges[p, n]["l"])  # 0-based label column
+        nparent = parents[0]
+        l = int(self.tree.edges[nparent, n]["l"])  # 0-based label index
 
-        out: List[np.ndarray] = []
+        Vxa: List[np.ndarray] = []
         for d in range(self.dim):
             N = self.nx[d]
-            P_flat = np.asarray(getattr(self.sysAbs[d], "P"), dtype=float)  # (N, N*nu)
-            if P_flat.shape[1] % N != 0:
-                raise ValueError(f"P must be (N, N*nu); got {P_flat.shape}")
+
+            # Get flat transition P_flat[d] with shape (N, N*nu)
+            P_flat = np.asarray(getattr(self.sysAbs[d], "P"), dtype=float)
+            if P_flat.shape[0] != N or (P_flat.shape[1] % N) != 0:
+                raise ValueError(f"P must be (N, N*nu); got {P_flat.shape} for dim {d}")
             nu = P_flat.shape[1] // N
 
-            v_parent = self.V[d][p, :]                   # (N,)
-            mask = self.L[d][l, :].astype(float)         # (N,)
-            Q = np.zeros((N, nu), dtype=float)
+            # Row vectors (1, N): mask and parent value
+            mask_row = np.asarray(self.L[d][l, :], dtype=float).reshape(1, -1)
+            v_parent_row = np.asarray(self.V[d][nparent, :], dtype=float).reshape(1, -1)
 
-            # ---- key change: slice blocks explicitly, matching Pc's convention ----
-            for u in range(nu):
-                Bu = P_flat[:, u * N:(u + 1) * N]        # (N, N) block for action u
-                # 1) force both to row vectors
-                mask_row = np.asarray(mask).reshape(1, -1)  # (1, N)
-                v_parent_row = np.asarray(v_parent).reshape(1, -1)  # (1, N)
+            # Elementwise mask, then multiply by flat transitions
+            w = mask_row * v_parent_row  # (1, N)
+            prod = w @ P_flat  # (1, N*nu)
 
-                # 2) elementwise multiply stays row-shaped
-                v_new_row = mask_row * v_parent_row  # (1, N)
+            # Reshape blockwise into (N, nu): split N*nu into nu blocks of length N
+            Vxa_d = prod.reshape(nu, N).T  # (N, nu)
+            Vxa.append(Vxa_d)
 
-                # 3) row @ matrix -> row
-                out_row = v_new_row @ Bu  # (1, K)
-                out_1D = out_row.ravel()  # (K,) if you prefer 1-D
-
-                Q[:, u] = out_1D  # -> (1000,)
-
-            out.append(Q)
-        return out
+        return Vxa
 
     # ---------- policy improvement ----------
     def maxpolicy(self, rho):
         """
-        Greedy, per-DFA-state, per-dimension improvement.
-        Keeps existing policies for skipped states (e.g., F and sink).
+        Stateless greedy improvement:
+          - uses UNIFORM policy to compute c[d]
+          - computes greedy actions per (q,d)
+          - updates ONLY self.Pxx[q][d] in-place
         """
-        nq = len(self.DFA.S)
-        new_pol = copy.deepcopy(self.pol)  # preserve skipped states' policy
+        from scipy.sparse import csr_matrix
+        import numpy as np
 
         skip = {int(self.DFA.F)}
         if hasattr(self.DFA, "sink") and getattr(self.DFA, "sink") is not None:
             skip.add(int(self.DFA.sink))
 
+        # helper: uniform policy for a dimension d
+        def uniform_pol_dense(d: int) -> np.ndarray:
+            N = self.nx[d]
+            nu = self._nu_of_dim(d)
+            return np.full((N, nu), 1.0 / nu, dtype=float)
+
         for q in set(self.DFA.S) - skip:
             if not self.Q[q]:
+                # still refresh cache to be consistent with the "current" (uniform) policy
+                for d in range(self.dim):
+                    self.Pxx[q][d] = self.Pc(self.sysAbs[d].P_flat, uniform_pol_dense(d))
                 continue
 
-            Vxa = [np.zeros((self.nx[d], self._nu_of_dim(d)), dtype=float) for d in range(self.dim)]
-            for n in self.Q[q]:
-                Qv = self.Q_n(n)  # List[(N,nu)]
+            # accumulate per-dimension scores
+            Vxa = [np.zeros((self.nx[d], self._nu_of_dim(d)), dtype=float)
+                   for d in range(self.dim)]
 
-                # constants c[d]
+            for n in self.Q[q]:
+                Qv = self.Q_n(n)  # list of (N, nu)
+
+                # constants c[d] using UNIFORM policy
                 c = np.zeros(self.dim, dtype=float)
                 for d in range(self.dim):
-                    pol_dense = self._as_dense_policy(q, d)     # (N,nu)
-                    vec = np.sum(Qv[d] * pol_dense, axis=1)     # (N,)
+                    pol_dense = uniform_pol_dense(d)  # (N, nu)
+                    vec = np.sum(Qv[d] * pol_dense, axis=1)  # (N,)
                     c[d] = float(np.asarray(rho[d]).ravel() @ vec)
 
                 prod_c = np.prod(c) if self.dim > 0 else 1.0
                 for d in range(self.dim):
-                    if self.dim == 1:
-                        scale = 1.0
-                    else:
-                        scale = (prod_c / c[d]) if c[d] != 0 else 0.0
-                    Vxa[d] += Qv[d] * scale
+                    scale = 1.0 if self.dim == 1 else ((prod_c / c[d]) if c[d] != 0 else 0.0)
+                    Vd = np.nan_to_num(Qv[d] * scale, nan=0.0, posinf=0.0, neginf=0.0)
+                    Vxa[d] += Vd
 
-            # Greedy per-dimension argmax -> one-hot; update Pxx
-            # Greedy per-dimension argmax -> one-hot; update Pxx
+            # greedy argmax per dimension -> update ONLY Pxx
             for d in range(self.dim):
-                Vd = Vxa[d]  # (N, nu)
-
-                # Be robust: replace NaN/±inf with 0 so argmax behaves
-                Vd = np.nan_to_num(Vd, nan=0.0, posinf=0.0, neginf=0.0)
-
-                # Default greedy choice
+                Vd = np.nan_to_num(Vxa[d], nan=0.0, posinf=0.0, neginf=0.0)  # (N, nu)
                 I = np.argmax(Vd, axis=1)  # (N,)
-
-                # If a row has no winner (all ~0), force action 0
-                no_winner = np.all(np.isclose(Vd, 0.0, atol=1e-15), axis=1)
-                I[no_winner] = 0
-
                 rows = np.arange(self.nx[d])
                 onehot = csr_matrix((np.ones(self.nx[d]), (rows, I)),
                                     shape=(self.nx[d], self._nu_of_dim(d)))
-                new_pol[q][d] = onehot
-                self.Pxx[q][d] = self.Pc(self.sysAbs[d], onehot)
 
-        self.pol = new_pol
-        return new_pol
+                self.Pxx[q][d] = self.Pc(self.sysAbs[d].P_flat, onehot)
+
+        return self.Pxx
 
     # ---------- pruning / relabeling ----------
     def findSubtree(self, n: int, nodeIDs: Optional[List[int]] = None) -> List[int]:
@@ -403,45 +398,25 @@ class DFATree:
 
     # ---------- Pc (controlled transitions) ----------
     @staticmethod
-    def Pc(sys_or_P: Union[Any, np.ndarray], pol: Union[np.ndarray, csr_matrix]) -> np.ndarray:
-        """
-        Controlled transition PC (N×N) from:
-          - sys_or_P: object with .P (flat (N, N*nu)) or a flat ndarray
-          - pol: (N,nu) dense or csr one-hot
+    def Pc(P_flat, pol):
+        Pprob = np.asarray(P_flat, float)
+        m, n = pol.shape
+        coo = pol.tocoo()
+        k = coo.row + coo.col * m
+        v = sparse.csr_matrix((coo.data, (np.zeros_like(k), k)), shape=(1, m*n))
+        v_den = np.asarray(v.toarray()).ravel()
+        Plarge = Pprob * v_den
 
-        MATLAB-consistent semantics:
-            Plarge = P_flat .* vec(pol)'   (i.e., repeat pol[:,u] across the N columns of block u)
-            PC = sum_u Plarge(:, u*N : (u+1)*N)
-        """
-        # 1) Get flat P
-        if isinstance(sys_or_P, np.ndarray):
-            P_flat = np.asarray(sys_or_P, dtype=float)
-        else:
-            P_flat = np.asarray(getattr(sys_or_P, "P"), dtype=float)
+        r,c = Plarge.shape
+        cr = c//r
+        Pcomp = np.zeros((r, r), dtype=Plarge.dtype)
+        for i in range(1,cr):
+            Pcomp = Pcomp + Plarge[:, (i-1)*r : i*r]
 
-        N, NU = P_flat.shape
-        if NU % N != 0:
-            raise ValueError(f"P must be (N, N*nu); got {P_flat.shape}")
-        nu = NU // N
 
-        # 2) Dense policy
-        if issparse(pol):
-            pol_dense = pol.toarray()
-        else:
-            pol_dense = np.asarray(pol, dtype=float)
-        if pol_dense.shape != (N, nu):
-            raise ValueError(f"Pc: policy must be (N,{nu}); got {pol_dense.shape}")
+        #end  = 1
+        return Pcomp
 
-        # 3) Repeat each policy column across the N columns of its action block
-        W = np.repeat(pol_dense, repeats=N, axis=1)  # (N, N*nu)
-
-        # 4) Elementwise weight, then sum N-column blocks
-        Plarge = P_flat * W  # (N, N*nu)
-        PC = np.zeros((N, N), dtype=float)
-        for u in range(nu):
-            PC += Plarge[:, u * N: (u + 1) * N]  # block-sum
-
-        return PC
 
     # ---------- label helper ----------
     @staticmethod

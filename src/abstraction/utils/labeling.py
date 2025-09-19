@@ -150,8 +150,8 @@ def plot_binary_matrix(mat, title="", row_labels=None, outfile=None,
     ax.grid(False)
     plt.tight_layout()
 
-    if outfile:
-        plt.savefig(outfile, bbox_inches="tight")
+    # if outfile:
+        # plt.savefig(outfile, bbox_inches="tight")
     if show:
         plt.show()
     else:

@@ -157,6 +157,7 @@ class MDPModel:
             nu: Union[int, List[int], Tuple[int, ...]],
             *,
             placement: str = 'centers',
+            u_placement: Optional[str] = None,
             filter_inside: bool = True,
             tol: float = 1e-15,
             renormalize: bool = True,
@@ -175,6 +176,9 @@ class MDPModel:
         nx   : int or sequence — grid counts per state dimension
         nu   : int or sequence — grid counts per input dimension
         placement : {'centers','endpoints'} — grid placement
+        u_placement: {'centers','endpoints','log'} or None
+                     If provided, overrides `placement` for *inputs* only.
+                     'log' creates log-spaced endpoints (requires positive bounds).
         filter_inside : keep only points inside the polytopes
         tol : small probability cutoff inside transition builder
         renormalize : per (row,action) distribution normalization
@@ -187,12 +191,15 @@ class MDPModel:
         X_poly_or_bounds = X_bounds if X_bounds is not None else orig.X
         U_poly_or_bounds = U_bounds if U_bounds is not None else orig.U
 
+        # use u_placement if given; else fall back to placement
+        up = u_placement if u_placement is not None else placement
+
         X_axes, X_points = cls.make_uniform_grid(X_poly_or_bounds, grid_counts=nx,
                                                  filter_inside=filter_inside,
                                                  placement=placement)
         U_axes, U_points = cls.make_uniform_grid(U_poly_or_bounds, grid_counts=nu,
                                                  filter_inside=filter_inside,
-                                                 placement=placement)
+                                                 placement=up)
 
         # U_points shape -> (M, m)
         if U_points.ndim == 1:
@@ -306,7 +313,8 @@ class MDPModel:
         U_poly : polytope.Polytope (bounded)
         grid_counts : int or iterable of ints (per dimension)
         filter_inside : keep only points inside polytope
-        placement : 'centers' (cell centers) or 'endpoints' (linspace)
+        placement : {'centers','endpoints','log'}
+                    'log' creates log-spaced *endpoints* (requires strictly positive bounds).
 
         Returns
         -------
@@ -337,6 +345,52 @@ class MDPModel:
             elif placement == 'centers':
                 step = (U - L) / m
                 ax = L + step * (0.5 + np.arange(m))
+            elif placement == 'log':
+                # Log-like spacing for any sign pattern:
+                # - L>0,U>0: standard logspace(L..U)
+                # - L<0,U<0: logspace on |bounds| then negate
+                # - L<0<U:   symmetric log density around 0 (no exact 0 included)
+
+                # guard for degenerate interval
+                if not (U > L):
+                    raise ValueError(f"Degenerate bounds [{L}, {U}] on dim {i}.")
+
+                tiny = 1e-12
+                # scale epsilon to the interval size so we don't collapse points
+                eps = max(tiny, min(abs(L) if L != 0 else np.inf, abs(U) if U != 0 else np.inf) * 1e-9)
+
+                if L > 0 and U > 0:
+                    # standard positive logspace, include endpoints
+                    ax = np.logspace(np.log10(L), np.log10(U), m)
+
+                elif U < 0 and L < 0:
+                    # fully negative range: build on magnitudes and negate
+                    # use endpoints |U| (closest to 0) .. |L| (largest magnitude), then negate & sort ascending
+                    mags = np.logspace(np.log10(abs(U)), np.log10(abs(L)), m)
+                    ax = -mags
+                    ax = np.sort(ax)  # from most negative (L) to least negative (U)
+
+                else:
+                    # range crosses zero: split points between negative and positive sides
+                    # allocate roughly half/half, ensuring both sides get at least 1 point
+                    m_pos = max(1, int(np.ceil(m / 2)))
+                    m_neg = max(1, m - m_pos)
+
+                    # positive side: from small epsilon up to U (avoid exact 0)
+                    # ensure start < stop in logspace
+                    start_pos = max(eps, min(U, 1.0) * eps)
+                    pos = np.logspace(np.log10(start_pos), np.log10(U), m_pos)
+
+                    # negative side: from L up to small magnitude (avoid exact 0)
+                    # build magnitudes then negate and put in ascending order
+                    start_neg_mag = max(eps, min(abs(L), 1.0) * eps)
+                    neg_mag = np.logspace(np.log10(start_neg_mag), np.log10(abs(L)), m_neg)
+                    neg = -neg_mag[::-1]  # from L (most negative) towards -small
+
+                    ax = np.concatenate([neg, pos])
+
+                ax = np.asarray(ax, dtype=float)
+
             else:
                 raise ValueError("placement must be 'centers' or 'endpoints'")
             axes.append(ax)
@@ -383,20 +437,25 @@ class MDPModel:
 
     @staticmethod
     def transition_matrix_nd_separable(
-        sys,
-        X_axes: List[Array],
-        U_points: Array,
-        X_poly,
-        tol: float = 1e-15,
-        renormalize: bool = True,
-        return_flat: bool = True,
+            sys,
+            X_axes: List[Array],
+            U_points: Array,
+            X_poly,
+            tol: float = 1e-15,
+            renormalize: bool = True,
+            return_flat: bool = True,
     ) -> Array:
         """
-        Build an n-D (dimension-wise independent) Gaussian-noise transition matrix.
-        Matches MATLAB cp/Kronecker logic used in your repo.
+        Build P matching the MATLAB reference:
 
-        Returns P:
-          - (N, N*M) if return_flat, otherwise (N, N, M)
+            pij_ = 1
+            for d = 1:dim
+                cp = diff(NormalCDF(edges_d, mean_d, std_d))
+                pij_ = reshape(pij_' * cp, 1, [])
+            end
+            P(i,:,k) = pij_
+
+        Key point: pij_ update is equivalent to pij_ = kron(cp, pij_).
         """
         A = np.asarray(sys.A, dtype=float)
         B = np.asarray(sys.B, dtype=float)
@@ -404,67 +463,70 @@ class MDPModel:
         mu_w = np.asarray(sys.mu, dtype=float).reshape(-1, 1)
         Sigma_w = np.asarray(sys.sigma, dtype=float)
 
-        n = A.shape[0]
+        # grids / sizes
         X_axes = [np.asarray(ax, dtype=float).ravel() for ax in X_axes]
         l = [ax.size for ax in X_axes]
+        n = len(l)
         N = int(np.prod(l))
 
-        m = B.shape[1]
         U_points = np.asarray(U_points, dtype=float)
         if U_points.ndim == 1:
-            U_points = U_points.reshape(-1, m)
-        else:
-            if U_points.shape[1] != m:
-                if U_points.shape[0] == m:
-                    U_points = U_points.T
-                else:
-                    U_points = U_points.reshape(-1, m)
+            U_points = U_points.reshape(-1, B.shape[1])
         M = U_points.shape[0]
 
-        edges = MDPModel._edges_from_axes(X_axes, X_poly)
+        # per-dimension bin edges
+        edges = MDPModel._edges_from_axes(X_axes, X_poly)  # list of (l_d+1,) arrays
+
+        # noise std per state dim
         std = MDPModel._diag_std_from_noise(Bw, Sigma_w)
         if np.any(std == 0.0):
             raise ValueError("Some dimensions have zero noise std; handle degenerate dims separately.")
 
+        # precompute grid points XhatSpace (N, n)
         meshes = np.meshgrid(*X_axes, indexing="ij")
-        XhatSpace = np.stack([m_.reshape(-1) for m_ in meshes], axis=1)
+        XhatSpace = np.stack([m.reshape(-1) for m in meshes], axis=1)
 
-        P = np.zeros((N, N * M), dtype=float) if return_flat else np.zeros((N, N, M), dtype=float)
+        # allocate P
+        P_blocks = np.zeros((N, N, M), dtype=float)
 
-        Bu = U_points @ B.T             # (M, n)
-        w_mean = (Bw @ mu_w).ravel()    # (n,)
+        # affine pieces shared in loops
+        Bu = U_points @ B.T  # (M, n)
+        w_mean = (Bw @ mu_w).ravel()  # (n,)
 
+        # main loops: state rows i, actions k
         for i in range(N):
-            xi = XhatSpace[i, :]                  # (n,)
-            Axi = (A @ xi).ravel()                # (n,)
-            means_all = Bu + Axi + w_mean         # (M, n)
+            xi = XhatSpace[i, :]  # (n,)
+            Axi = (A @ xi).ravel()  # (n,)
+            means_all = Bu + Axi + w_mean  # (M, n)
 
             for k in range(M):
-                m_vec = means_all[k, :]           # (n,)
-                probs_per_dim = []
+                m_vec = means_all[k, :]  # (n,)
+
+                # build per-dim cell probabilities cp_d = diff(CDF(edges_d))
+                # and accumulate with the MATLAB-consistent order:
+                # pij = kron(cp_d, pij)
+                pij = np.array([1.0], dtype=float)
                 for d in range(n):
                     e = edges[d]
                     cdf_r = _normal_cdf(e[1:], m_vec[d], std[d])
                     cdf_l = _normal_cdf(e[:-1], m_vec[d], std[d])
-                    cp = (cdf_r - cdf_l)
+                    cp = cdf_r - cdf_l
                     cp[cp < tol] = 0.0
-                    probs_per_dim.append(cp)
-
-                # Kronecker product across dimensions -> length N
-                pij = probs_per_dim[0]
-                for d in range(1, n):
-                    pij = np.kron(pij, probs_per_dim[d])
+                    # --- critical: match MATLAB reshape(pij_'*cp,1,[]) ---
+                    pij = np.kron(cp, pij)  # NOT np.kron(pij, cp)
 
                 if renormalize:
-                    s = pij.sum() + 1e-15
-                    pij = pij / s
+                    s = pij.sum()
+                    if s > 0:
+                        pij = pij / s
 
-                if return_flat:
-                    P[i, k * N : (k + 1) * N] = pij
-                else:
-                    P[i, :, k] = pij
+                P_blocks[i, :, k] = pij  # (N,)
 
-        return P
+        if return_flat:
+            # matches MATLAB: reshape(permute(P,[2 1 3]), N, [])
+            return _flat_from_blocks(P_blocks)  # uses order="F"
+        else:
+            return P_blocks
 
     # ======================================
     # Sub-stochastic row processing (optional)
