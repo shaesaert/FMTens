@@ -251,14 +251,14 @@ class DFATree:
         nparent = parents[0]
         l = int(self.tree.edges[nparent, n]["l"])  # 0-based label index
 
-        Vxa: List[np.ndarray] = []
+        Qv: List[np.ndarray] = []
         for d in range(self.dim):
             N = self.nx[d]
 
             # Get flat transition P_flat[d] with shape (N, N*nu)
-            P_flat = np.asarray(getattr(self.sysAbs[d], "P"), dtype=float)
-            if P_flat.shape[0] != N or (P_flat.shape[1] % N) != 0:
-                raise ValueError(f"P must be (N, N*nu); got {P_flat.shape} for dim {d}")
+            P_flat = np.asarray(getattr(self.sysAbs[d], "P"), dtype=float, order='F')
+            # if P_flat.shape[0] != N or (P_flat.shape[1] % N) != 0:
+            #     raise ValueError(f"P must be (N, N*nu); got {P_flat.shape} for dim {d}")
             nu = P_flat.shape[1] // N
 
             # Row vectors (1, N): mask and parent value
@@ -267,13 +267,13 @@ class DFATree:
 
             # Elementwise mask, then multiply by flat transitions
             w = mask_row * v_parent_row  # (1, N)
-            prod = w @ P_flat  # (1, N*nu)
+            prod = np.asfortranarray(w) @ P_flat  # (1, N*nu)
 
             # Reshape blockwise into (N, nu): split N*nu into nu blocks of length N
-            Vxa_d = prod.reshape(nu, N).T  # (N, nu)
-            Vxa.append(Vxa_d)
-
-        return Vxa
+            #Vxa_d = prod.reshape(nu, N).T  # (N, nu)
+            Qv_d = np.reshape(prod, (N, nu), order='F')
+            Qv.append(Qv_d)
+        return Qv
 
     # ---------- policy improvement ----------
     def maxpolicy(self, rho):
@@ -283,22 +283,26 @@ class DFATree:
           - computes greedy actions per (q,d)
           - updates ONLY self.Pxx[q][d] in-place
         """
-        from scipy.sparse import csr_matrix
         import numpy as np
+        import scipy.sparse as sparse
 
+        num_states = len(self.DFA.S)
+        pol = np.empty((num_states, self.dim), dtype=object)
+
+        # states to skip (final/sink)
         skip = {int(self.DFA.F)}
         if hasattr(self.DFA, "sink") and getattr(self.DFA, "sink") is not None:
             skip.add(int(self.DFA.sink))
 
-        # helper: uniform policy for a dimension d
+        # helper: dense uniform policy for a dimension d
         def uniform_pol_dense(d: int) -> np.ndarray:
             N = self.nx[d]
             nu = self._nu_of_dim(d)
             return np.full((N, nu), 1.0 / nu, dtype=float)
 
         for q in set(self.DFA.S) - skip:
+            # If there's no Q for this state, refresh cache with uniform policy and continue
             if not self.Q[q]:
-                # still refresh cache to be consistent with the "current" (uniform) policy
                 for d in range(self.dim):
                     self.Pxx[q][d] = self.Pc(self.sysAbs[d].P_flat, uniform_pol_dense(d))
                 continue
@@ -307,31 +311,39 @@ class DFATree:
             Vxa = [np.zeros((self.nx[d], self._nu_of_dim(d)), dtype=float)
                    for d in range(self.dim)]
 
+            # iterate over all n in Q[q]
             for n in self.Q[q]:
-                Qv = self.Q_n(n)  # list of (N, nu)
+                Qv = self.Q_n(n)  # list of arrays, each (N_d, nu_d)
 
                 # constants c[d] using UNIFORM policy
                 c = np.zeros(self.dim, dtype=float)
                 for d in range(self.dim):
-                    pol_dense = uniform_pol_dense(d)  # (N, nu)
-                    vec = np.sum(Qv[d] * pol_dense, axis=1)  # (N,)
-                    c[d] = float(np.asarray(rho[d]).ravel() @ vec)
+                    pol_dense = uniform_pol_dense(d)  # (N_d, nu_d)
+                    vec = np.sum(Qv[d] * pol_dense, axis=1)  # (N_d,)
+                    c[d] = float(np.asarray(rho[d]).ravel() @ vec)  # scalar
 
-                prod_c = np.prod(c) if self.dim > 0 else 1.0
+                # scale[d] = prod(c) / c[d] (handle zeros safely)
+                prod_c = float(np.prod(c)) if self.dim > 0 else 1.0
+                # where c[d] == 0, use 0.0 to avoid Inf; we'll also nan_to_num below
+                scale = np.divide(prod_c, c, out=np.zeros_like(c), where=(c != 0))
+
+                # accumulate contribution to Vxa[d]
                 for d in range(self.dim):
-                    scale = 1.0 if self.dim == 1 else ((prod_c / c[d]) if c[d] != 0 else 0.0)
-                    Vd = np.nan_to_num(Qv[d] * scale, nan=0.0, posinf=0.0, neginf=0.0)
-                    Vxa[d] += Vd
+                    contrib = np.nan_to_num(
+                        Qv[d] * scale[d],
+                        nan=0.0, posinf=0.0, neginf=0.0
+                    )  # (N_d, nu_d)
+                    Vxa[d] += contrib
 
             # greedy argmax per dimension -> update ONLY Pxx
             for d in range(self.dim):
-                Vd = np.nan_to_num(Vxa[d], nan=0.0, posinf=0.0, neginf=0.0)  # (N, nu)
-                I = np.argmax(Vd, axis=1)  # (N,)
-                rows = np.arange(self.nx[d])
-                onehot = csr_matrix((np.ones(self.nx[d]), (rows, I)),
-                                    shape=(self.nx[d], self._nu_of_dim(d)))
-
-                self.Pxx[q][d] = self.Pc(self.sysAbs[d].P_flat, onehot)
+                I = np.argmax(Vxa[d], axis=1)  # choose best action per state row
+                rows = np.arange(Vxa[d].shape[0])
+                pol[q][d] = sparse.csr_matrix(
+                    (np.ones_like(rows, dtype=float), (rows, I)),
+                    shape=Vxa[d].shape
+                )
+                self.Pxx[q][d] = self.Pc(self.sysAbs[d].P_flat,pol[q][d])
 
         return self.Pxx
 
@@ -413,8 +425,6 @@ class DFATree:
         for i in range(1,cr):
             Pcomp = Pcomp + Plarge[:, (i-1)*r : i*r]
 
-
-        #end  = 1
         return Pcomp
 
 
