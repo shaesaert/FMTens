@@ -101,22 +101,28 @@ sysAbs = {
 with h5py.File(Path(__file__).resolve().parents[2] / "mdata" / "mdp_probs.mat", "r") as f:
     P1_flat, P2_flat = np.array(f["P1_flat"]).T, np.array(f["P2_flat"]).T
 
-# sysAbs[0].P = P1_flat
-# sysAbs[1].P = P2_flat
-# def overwrite_P_from_mat(mdp, P_flat_new):
-#     P_flat_new = np.asarray(P_flat_new, dtype=float)
-#     N = mdp.N
-#     if P_flat_new.shape[0] != N or P_flat_new.shape[1] % N != 0:
-#         raise ValueError(f"Bad shape {P_flat_new.shape}; expected (N, N*M) with N={N}")
-#
-#     # Install flat and rebuild blocks in Fortran order (MATLAB-compatible)
-#     mdp._P_flat = P_flat_new.copy()                          # private
-#     M = P_flat_new.shape[1] // N
-#     mdp._P_blocks = P_flat_new.reshape(N, N, M, order="F")   # private
-#     mdp.P = mdp._P_flat                                      # public alias
-# overwrite_P_from_mat(sysAbs[0], P1_flat)
-# overwrite_P_from_mat(sysAbs[1], P2_flat)
+USE_PSAS_OVERRIDE = True # Set this to False after fixing abstraction
 
+if USE_PSAS_OVERRIDE:
+    sysAbs[0].P = P1_flat
+    sysAbs[1].P = P2_flat
+
+
+    def overwrite_P_from_mat(mdp, P_flat_new):
+        P_flat_new = np.asarray(P_flat_new, dtype=float)
+        N = mdp.N
+        if P_flat_new.shape[0] != N or P_flat_new.shape[1] % N != 0:
+            raise ValueError(f"Bad shape {P_flat_new.shape}; expected (N, N*M) with N={N}")
+
+        # Install flat and rebuild blocks in Fortran order (MATLAB-compatible)
+        mdp._P_flat = P_flat_new.copy()  # private
+        M = P_flat_new.shape[1] // N
+        mdp._P_blocks = P_flat_new.reshape(N, N, M, order="F")  # private
+        mdp.P = mdp._P_flat  # public alias
+
+
+    overwrite_P_from_mat(sysAbs[0], P1_flat)
+    overwrite_P_from_mat(sysAbs[1], P2_flat)
 
 # -----------------------
 # Labeling
@@ -153,26 +159,24 @@ G.initiate()
 plot_tree_layered(G)
 
 # -----------------------
-# FIXME 1)@Ruohan: G.maxpolicy(rho): machine precision difference (e-15) in Vxa[1] results in different policy for sys[1] (2nd dimension
-# FIXME 2)@Ruohan: G.update_tree(): nonsmooth probabilities updated for dim 0, node.1 (second node), G.V[0] (1,:), only 0 or 1
-# FIXME 3)@Ruohan: G.update_tree(): too low probabilities for dim1, node.1 (second node), G.V[1] (1,:)
-# G.Pxx not updated identical compared to matlab
-# Load and impose Pxx computed from matlab
+# Optional: Load and impose Pxx computed from matlab
 # -----------------------
 with h5py.File(Path(__file__).resolve().parents[2] / "mdata" / "dfa_pxx.mat", "r") as f: Pxx1, Pxx2 = np.array(
     f["Pxx1"]).T, np.array(f["Pxx2"]).T
 USE_PXX_OVERRIDE = False  # set True to impose Pxx computed from MATLAB, set False to use Pxx computed based on DFATree
 
-# 2) Tree.maxpolicy
-G.maxpolicy(rho)
+# 2) Grow tree
+T = 5
+for it in range(1, T + 1):
+    print(f"\n=== Iteration {it} ===")
+    G.maxpolicy(rho)
+    # if USE_PXX_OVERRIDE:
+    #     G.Pxx[1][0] = Pxx1
+    #     G.Pxx[1][1] = Pxx2
+    G.update_tree()
+    G.grow()
+    plot_tree_layered(G)
 
-if USE_PXX_OVERRIDE:
-    G.Pxx[1][0] = Pxx1
-    G.Pxx[1][1] = Pxx2
-
-G.update_tree()
-plot_tree_layered(G)
-G.grow()
 
 exit = 1
 # -----------------------
