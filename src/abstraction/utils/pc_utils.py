@@ -36,8 +36,7 @@ def Pc(P_flat, pol) -> np.ndarray:
     cr = c // r
     Pcomp = np.zeros((r, r), dtype=Plarge.dtype)
 
-    # for i in range(1, cr):
-    #     Pcomp = Pcomp + Plarge[:, (i - 1) * r : i * r]
+
     for i in range(cr):  # i = 0..cr-1
         Pcomp += Plarge[:, i * r: (i + 1) * r]
 

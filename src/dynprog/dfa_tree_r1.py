@@ -409,25 +409,6 @@ class DFATree:
         plt.axis("off")
         plt.show()
 
-    # # ---------- Pc (controlled transitions) ----------
-    # @staticmethod
-    # def Pc(P_flat, pol):
-    #     Pprob = np.asarray(P_flat, float)
-    #     m, n = pol.shape
-    #     coo = pol.tocoo()
-    #     k = coo.row + coo.col * m
-    #     v = sparse.csr_matrix((coo.data, (np.zeros_like(k), k)), shape=(1, m*n))
-    #     v_den = np.asarray(v.toarray()).ravel()
-    #     Plarge = Pprob * v_den
-    #
-    #     r,c = Plarge.shape
-    #     cr = c//r
-    #     Pcomp = np.zeros((r, r), dtype=Plarge.dtype)
-    #     for i in range(1,cr):
-    #         Pcomp = Pcomp + Plarge[:, (i-1)*r : i*r]
-    #
-    #     return Pcomp
-
 
     # ---------- label helper ----------
     @staticmethod
