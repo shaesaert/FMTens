@@ -158,21 +158,11 @@ G = DFATree(DFA, sysAbs, pol, nx_list, L_list)
 G.initiate()
 plot_tree_layered(G)
 
-# -----------------------
-# Optional: Load and impose Pxx computed from matlab
-# -----------------------
-with h5py.File(Path(__file__).resolve().parents[2] / "mdata" / "dfa_pxx.mat", "r") as f: Pxx1, Pxx2 = np.array(
-    f["Pxx1"]).T, np.array(f["Pxx2"]).T
-USE_PXX_OVERRIDE = False  # set True to impose Pxx computed from MATLAB, set False to use Pxx computed based on DFATree
-
 # 2) Grow tree
 T = 5
 for it in range(1, T + 1):
     print(f"\n=== Iteration {it} ===")
     G.maxpolicy(rho)
-    # if USE_PXX_OVERRIDE:
-    #     G.Pxx[1][0] = Pxx1
-    #     G.Pxx[1][1] = Pxx2
     G.update_tree()
     G.grow()
     plot_tree_layered(G)
