@@ -358,6 +358,58 @@ class DFATree:
         nodeIDs.append(n)
         return nodeIDs
 
+    def prune(self, tol: float, *args) -> None:
+        """
+        Prune nodes whose product over dimensions of max V along the row is < tol.
+        Usage:
+            prune(tol)            -> consider ALL nodes
+            prune(tol, 'leafs')   -> consider ONLY current leaf nodes
+        """
+        use_leafs = (len(args) >= 1) and (args[0] == 'leafs')
+
+        # rows to evaluate
+        if use_leafs:
+            rows = np.asarray(self.leafs, dtype=int)
+        else:
+            rows = np.arange(self.tree.number_of_nodes(), dtype=int)
+
+        if rows.size == 0:
+            return
+
+        # per-dimension max over columns, for the chosen rows
+        # max_vals[d] has shape (len(rows),)
+        max_vals = []
+        for d in range(self.dim):
+            Vd = np.asarray(self.V[d], dtype=float)
+            # guard if V has fewer rows (shouldn't happen, but safe)
+            nrows = min(Vd.shape[0], rows.max() + 1) if rows.size else 0
+            sel = rows[rows < nrows]
+            if sel.size == 0:
+                max_vals.append(np.zeros(rows.shape[0], dtype=float))
+                continue
+
+            md = np.zeros(rows.shape[0], dtype=float)
+            md[np.isin(rows, sel)] = np.max(Vd[sel, :], axis=1)
+            max_vals.append(md)
+
+        # product across dimensions (elementwise)
+        prod_vals = np.ones(rows.shape[0], dtype=float)
+        for md in max_vals:
+            prod_vals *= md
+
+        # nodes to prune: product < tol
+        idx = np.where(prod_vals < tol)[0]
+        if idx.size == 0:
+            return
+
+        if use_leafs:
+            nodeids = [int(self.leafs[i]) for i in idx]
+        else:
+            nodeids = [int(rows[i]) for i in idx]
+
+        print(f"Pruning nodeids = {nodeids}")
+        self.removeBranch(nodeids)
+
     def removeBranch(self, nodes: List[int]) -> None:
         """
         Remove subtrees rooted at given nodes. After deletion, re-label the remaining
