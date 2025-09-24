@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 import numpy as np
 import polytope as pc
+from fontTools.misc.plistlib import end_array
 from scipy.special import erf as _erf
 
 Array = np.ndarray
@@ -405,6 +406,11 @@ class MDPModel:
         if filter_inside:
             points = MDPModel._filter_points_in_poly(U_poly, points)
 
+        # row: dim_x, column: grid number, matching matlab style
+        points = points.T
+        for i, ax in enumerate(axes):
+            axes[i] = np.asarray(ax).reshape(1, -1)   # shape: (len(ax), 1)
+
         return axes, points
 
     # ==========================================
@@ -441,92 +447,73 @@ class MDPModel:
             X_axes: List[Array],
             U_points: Array,
             X_poly,
-            tol: float = 1e-15,
+            tol: float = 1e-19,
             renormalize: bool = True,
             return_flat: bool = True,
     ) -> Array:
-        """
-        Build P matching the MATLAB reference:
 
-            pij_ = 1
-            for d = 1:dim
-                cp = diff(NormalCDF(edges_d, mean_d, std_d))
-                pij_ = reshape(pij_' * cp, 1, [])
-            end
-            P(i,:,k) = pij_
+        import numpy as _np
 
-        Key point: pij_ update is equivalent to pij_ = kron(cp, pij_).
-        """
-        A = np.asarray(sys.A, dtype=float)
-        B = np.asarray(sys.B, dtype=float)
-        Bw = np.asarray(sys.Bw, dtype=float)
-        mu_w = np.asarray(sys.mu, dtype=float).reshape(-1, 1)
-        Sigma_w = np.asarray(sys.sigma, dtype=float)
+        A = _np.asarray(sys.A, dtype=float)
+        B = _np.asarray(sys.B, dtype=float)     # (n, m)
+        Bw = _np.asarray(sys.Bw, dtype=float)
+        mu_w = _np.asarray(sys.mu, dtype=float).reshape(-1, 1)
+        Sigma_w = _np.asarray(sys.sigma, dtype=float)
+        sigma_z = _np.asarray(sys.Bw*Sigma_w*sys.Bw.T, dtype=float)
+        mu_z = _np.asarray(sys.Bw*sys.mu, dtype=float)
 
-        # grids / sizes
-        X_axes = [np.asarray(ax, dtype=float).ravel() for ax in X_axes]
-        l = [ax.size for ax in X_axes]
-        n = len(l)
-        N = int(np.prod(l))
+        # ---- grids / sizes ----
+        hx = _np.asarray(X_axes, dtype=float)[0] # state points, each grid -> column
+        hx_arr = np.asarray(hx, dtype=float).ravel()
+        mids = 0.5 * (hx_arr[:-1] + hx_arr[1:])  # (N-1,)
+        left = hx_arr[0] - 0.5 * (hx_arr[1] - hx_arr[0])
+        right = hx_arr[-1] + 0.5 * (hx_arr[-1] - hx_arr[-2])
+        # TODO@Ruohan: compute mx as the bounds of hx  N+1
+        mxT = np.concatenate(([left], mids, [right]))  # (N+1,)
+        mx = mxT.reshape(1,-1)
 
-        U_points = np.asarray(U_points, dtype=float)
-        if U_points.ndim == 1:
-            U_points = U_points.reshape(-1, B.shape[1])
-        M = U_points.shape[0]
+        #TODO@Ruohan: XhatSpace = hx
+        XhatSpace = hx
 
-        # per-dimension bin edges
-        edges = MDPModel._edges_from_axes(X_axes, X_poly)  # list of (l_d+1,) arrays
-
-        # noise std per state dim
-        std = MDPModel._diag_std_from_noise(Bw, Sigma_w)
-        if np.any(std == 0.0):
-            raise ValueError("Some dimensions have zero noise std; handle degenerate dims separately.")
-
-        # precompute grid points XhatSpace (N, n)
-        meshes = np.meshgrid(*X_axes, indexing="ij")
-        XhatSpace = np.stack([m.reshape(-1) for m in meshes], axis=1)
-
-        # allocate P
+        N = hx.shape[1]
+        M = U_points.shape[1]
+        # TODO@Ruohan: initialize P_blocks : (N,N,M) N is number of grid points of state, M is .. of  input
         P_blocks = np.zeros((N, N, M), dtype=float)
+        dim_i = 1
 
-        # affine pieces shared in loops
-        Bu = U_points @ B.T  # (M, n)
-        w_mean = (Bw @ mu_w).ravel()  # (n,)
+        #TODO@Ruohan:
+        # loop layer (1): i1 = 1:length(uhat)=M
+        # loop layer (2): i2 = 1:length(XhatSpace)=N
+        #                   "xhat = XhatSpace[:,i2]"
+        #                   "pij_ = 1"
+        # loop layer (3): i3 = 1:dim_agent=1  " "
+        from scipy.stats import norm
 
-        # main loops: state rows i, actions k
-        for i in range(N):
-            xi = XhatSpace[i, :]  # (n,)
-            Axi = (A @ xi).ravel()  # (n,)
-            means_all = Bu + Axi + w_mean  # (M, n)
+        for k in range(1, M+1):  # use k-1 for indexing
+            for index in range(1, N+1):  # use index-1 for indexing
+                xhat = XhatSpace[:,index-1]
+                pij_ = np.array([1.0], dtype=float)
+                for d_index in range(dim_i): # use d_index for indexing
+                    cdf_vals = norm.cdf(mx,A[d_index]*xhat+B[d_index]*U_points[:,k-1]+mu_z[d_index],sigma_z[d_index])
+                    cpdiff = np.diff(cdf_vals)
+                    cpdiff[cpdiff<tol] = 0
+                    pij_ = np.kron(cpdiff,pij_)
+                P_blocks[index-1,:,k-1] = pij_
 
-            for k in range(M):
-                m_vec = means_all[k, :]  # (n,)
-
-                # build per-dim cell probabilities cp_d = diff(CDF(edges_d))
-                # and accumulate with the MATLAB-consistent order:
-                # pij = kron(cp_d, pij)
-                pij = np.array([1.0], dtype=float)
-                for d in range(n):
-                    e = edges[d]
-                    cdf_r = _normal_cdf(e[1:], m_vec[d], std[d])
-                    cdf_l = _normal_cdf(e[:-1], m_vec[d], std[d])
-                    cp = cdf_r - cdf_l
-                    cp[cp < tol] = 0.0
-                    # --- critical: match MATLAB reshape(pij_'*cp,1,[]) ---
-                    pij = np.kron(cp, pij)  # NOT np.kron(pij, cp)
-
-                if renormalize:
-                    s = pij.sum()
-                    if s > 0:
-                        pij = pij / s
-
-                P_blocks[i, :, k] = pij  # (N,)
+        P_blocks_t = np.zeros((N, N, M), dtype=float)
+        for k in range(1, M+1):
+            P_blocks_t[:,:,k-1] = P_blocks[:,:,k-1].T
 
         if return_flat:
-            # matches MATLAB: reshape(permute(P,[2 1 3]), N, [])
-            return _flat_from_blocks(P_blocks)  # uses order="F"
+            N, _, M = P_blocks_t.shape
+            P_flat = np.empty((N, N * M), dtype=P_blocks_t.dtype)
+
+            for k in range(M):
+                P_flat[:, k * N: (k + 1) * N] = P_blocks_t[:, :, k]
+            return P_flat
         else:
-            return P_blocks
+            return P_blocks_t
+
 
     # ======================================
     # Sub-stochastic row processing (optional)

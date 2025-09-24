@@ -88,41 +88,10 @@ sysLTI[1].AP = ['p3']
 # -----------------------
 sysAbs = {
     0: MDPModel.from_system(sysLTI[0], nx=1000, nu=5, placement='centers', u_placement='endpoints',
-                            tol=1e-19, renormalize=True, contract_sum=1.0),
+                            tol=1e-19, renormalize=False, contract_sum=None),
     1: MDPModel.from_system(sysLTI[1], nx=1000, nu=5, placement='centers', u_placement='endpoints',
-                            tol=1e-19, renormalize=True, contract_sum=1.0),
+                            tol=1e-19, renormalize=False, contract_sum=None),
 }
-
-# -----------------------
-# FIXME @Ruohan: sysAbs[d].P_flat is different (max dev: 0.0399 ) from matlab
-# Transition probability matrix computed in mdpmodel NOT IDENTICAL to from MATLAB
-# Load and impose Psas computed from MATLAB
-# -----------------------
-with h5py.File(Path(__file__).resolve().parents[2] / "mdata" / "mdp_probs.mat", "r") as f:
-    P1_flat, P2_flat = np.array(f["P1_flat"]).T, np.array(f["P2_flat"]).T
-
-USE_PSAS_OVERRIDE = True # Set this to False after fixing abstraction
-
-if USE_PSAS_OVERRIDE:
-    sysAbs[0].P = P1_flat
-    sysAbs[1].P = P2_flat
-
-
-    def overwrite_P_from_mat(mdp, P_flat_new):
-        P_flat_new = np.asarray(P_flat_new, dtype=float)
-        N = mdp.N
-        if P_flat_new.shape[0] != N or P_flat_new.shape[1] % N != 0:
-            raise ValueError(f"Bad shape {P_flat_new.shape}; expected (N, N*M) with N={N}")
-
-        # Install flat and rebuild blocks in Fortran order (MATLAB-compatible)
-        mdp._P_flat = P_flat_new.copy()  # private
-        M = P_flat_new.shape[1] // N
-        mdp._P_blocks = P_flat_new.reshape(N, N, M, order="F")  # private
-        mdp.P = mdp._P_flat  # public alias
-
-
-    overwrite_P_from_mat(sysAbs[0], P1_flat)
-    overwrite_P_from_mat(sysAbs[1], P2_flat)
 
 # -----------------------
 # Labeling
