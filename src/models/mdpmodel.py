@@ -24,27 +24,22 @@ Highlights
 Dependencies: `numpy`, `polytope`, `scipy.special.erf`.
 """
 
+# ===============================
+# Imports & basic type alias
+# ===============================
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
+
 import numpy as np
 import polytope as pc
-from fontTools.misc.plistlib import end_array
-from scipy.special import erf as _erf
+from scipy.special import erf as _erf  # (kept as imported in your file)
 
 Array = np.ndarray
 
-
-# =====================
-# Helper math utilities
-# =====================
-
-def _normal_cdf(x: Array, m: float, s: float) -> Array:
-    """Gaussian CDF with mean m and std s; supports NumPy broadcasting."""
-    z = (x - m) / (s * np.sqrt(2.0))
-    return 0.5 * (1.0 + _erf(z))
-
-
+# ==========================================
+# Shape/helpers (MATLAB SysCoRe-compatible memory layout helpers)
+# ==========================================
 def _cartesian_from_axes(axes: List[Array]) -> Array:
     """Build (N, n) array from a list of 1D axes using meshgrid (indexing='ij')."""
     if len(axes) == 1:
@@ -67,7 +62,9 @@ def _blocks_from_flat(P_flat: np.ndarray, N: int) -> np.ndarray:
     M = P_flat.shape[1] // N
     return P_flat.reshape(N, N, M, order="F")
 
-
+# ===============================
+# MDPModel
+# ===============================
 @dataclass
 class MDPModel:
     # ---- public fields ----
@@ -246,7 +243,7 @@ class MDPModel:
         return self._P_flat
 
     # =====================
-    # Grid utilities (merged)
+    # Grid utilities
     # =====================
     @staticmethod
     def _bbox_from_polytope(poly_or_bounds) -> Tuple[np.ndarray, np.ndarray]:
@@ -278,8 +275,6 @@ class MDPModel:
         lower = V.min(axis=0)
         upper = V.max(axis=0)
         return lower, upper
-
-    # --- in src/models/mdpmodel.py ---
 
     @staticmethod
     def _filter_points_in_poly(P, pts: Array, tol: float = 1e-9) -> Array:
@@ -413,34 +408,7 @@ class MDPModel:
 
         return axes, points
 
-    # ==========================================
-    # Transition builder (merged from Psas.py)
-    # ==========================================
-    @staticmethod
-    def _edges_from_axes(X_axes: List[Array], X_poly) -> List[Array]:
-        """Per-dimension bin edges using domain bounds at ends and midpoints inside."""
-        lower, upper = MDPModel._bbox_from_polytope(X_poly)
-        edges = []
-        for d, ax in enumerate(X_axes):
-            ax = np.asarray(ax, dtype=float).ravel()
-            L, U = float(lower[d]), float(upper[d])
-            if ax.size == 1:
-                eps = 1e-12
-                e = np.array([ax[0] - eps, ax[0] + eps], dtype=float)
-            else:
-                mid = 0.5 * (ax[:-1] + ax[1:])
-                e = np.concatenate([[L], mid, [U]]).astype(float)
-            edges.append(e)
-        return edges
-
-    @staticmethod
-    def _diag_std_from_noise(Bw: Array, Sigma_w: Array) -> Array:
-        """Std of x^+ from noise: sqrt(diag(Bw * Sigma_w * Bw^T)) (per-dim)."""
-        Sigma_x = Bw @ Sigma_w @ Bw.T
-        var = np.clip(np.diag(Sigma_x), a_min=0.0, a_max=None)
-        std = np.sqrt(var)
-        return std
-
+    # ---------- transition builder ----------
     @staticmethod
     def transition_matrix_nd_separable(
             sys,
@@ -468,32 +436,25 @@ class MDPModel:
         mids = 0.5 * (hx_arr[:-1] + hx_arr[1:])  # (N-1,)
         left = hx_arr[0] - 0.5 * (hx_arr[1] - hx_arr[0])
         right = hx_arr[-1] + 0.5 * (hx_arr[-1] - hx_arr[-2])
-        # TODO@Ruohan: compute mx as the bounds of hx  N+1
+        #compute mx as the bounds of hx  N+1
         mxT = np.concatenate(([left], mids, [right]))  # (N+1,)
         mx = mxT.reshape(1,-1)
 
-        #TODO@Ruohan: XhatSpace = hx
         XhatSpace = hx
 
         N = hx.shape[1]
         M = U_points.shape[1]
-        # TODO@Ruohan: initialize P_blocks : (N,N,M) N is number of grid points of state, M is .. of  input
+        #initialize P_blocks : (N,N,M) N is number of grid points of state, M is .. of  input
         P_blocks = np.zeros((N, N, M), dtype=float)
         dim_i = 1
 
-        #TODO@Ruohan:
-        # loop layer (1): i1 = 1:length(uhat)=M
-        # loop layer (2): i2 = 1:length(XhatSpace)=N
-        #                   "xhat = XhatSpace[:,i2]"
-        #                   "pij_ = 1"
-        # loop layer (3): i3 = 1:dim_agent=1  " "
         from scipy.stats import norm
 
-        for k in range(1, M+1):  # use k-1 for indexing
-            for index in range(1, N+1):  # use index-1 for indexing
-                xhat = XhatSpace[:,index-1]
+        for k in range(1, M+1):  # # loop layer (1): i1 = 1:length(uhat)=M; use k-1 for indexing
+            for index in range(1, N+1):  # loop layer (2): i2 = 1:length(XhatSpace)=N; use index-1 for indexing
+                xhat = XhatSpace[:,index-1] # "xhat = XhatSpace[:,i2]"
                 pij_ = np.array([1.0], dtype=float)
-                for d_index in range(dim_i): # use d_index for indexing
+                for d_index in range(dim_i): # loop layer (3): i3 = 1:dim_agent=1; use d_index for indexing
                     cdf_vals = norm.cdf(mx,A[d_index]*xhat+B[d_index]*U_points[:,k-1]+mu_z[d_index],sigma_z[d_index])
                     cpdiff = np.diff(cdf_vals)
                     cpdiff[cpdiff<tol] = 0
@@ -563,119 +524,3 @@ class MDPModel:
         self._P_flat = _flat_from_blocks(P_new)
         self.P = self._P_flat
 
-    # =====================
-    # Dynamics wrappers / indexing
-    # =====================
-    def f_det(self, x: Array, u: Array) -> Array:
-        """Deterministic next state via original model (if provided)."""
-        if self.orig is None or not hasattr(self.orig, "f_det"):
-            raise RuntimeError("orig model with f_det(x,u) is required.")
-        return self.orig.f_det(np.asarray(x, dtype=float), np.asarray(u, dtype=float))
-
-    def state_multi_idx_from_x(self, x: Array) -> Tuple[int, ...]:
-        """Map a continuous state x (n,) to per-dimension grid indices via nearest neighbor."""
-        x = np.asarray(x, dtype=float).ravel()
-        if x.size != self.dim:
-            raise ValueError(f"x has dim {x.size}, expected {self.dim}")
-        idxs = []
-        for d, ax in enumerate(self.hx):
-            j = int(np.argmin(np.abs(ax - x[d])))
-            idxs.append(j)
-        return tuple(idxs)
-
-    def state_index_from_x(self, x: Array) -> int:
-        """Map x to a flat index in [0, N-1]."""
-        multi = self.state_multi_idx_from_x(x)
-        return int(np.ravel_multi_index(multi, self.l, order="C"))
-
-    def input_index_from_u(self, u: Array) -> int:
-        """Map a continuous input u (m,) to the nearest discrete input index."""
-        if self.inputs is None:
-            raise RuntimeError("inputs (discrete set) not provided.")
-        u = np.asarray(u, dtype=float).ravel()
-        m = self.inputs.shape[1]
-        if u.size != m:
-            raise ValueError(f"u has dim {u.size}, expected {m}")
-        dists = np.linalg.norm(self.inputs - u[None, :], axis=1)
-        return int(np.argmin(dists))
-
-    def idx_to_state(self, i: int) -> Array:
-        """Return the grid-state vector for flat index i."""
-        return self.states[int(i), :]
-
-    # -------------- abstract simulation --------------
-    def row_block(self, i: int, k: int) -> Array:
-        """Return the (N,) transition probability vector for row i under action k."""
-        return self._P_blocks[int(i), :, int(k)]
-
-    def sim_index(self, i: int, k: int, rng: Optional[np.random.Generator] = None) -> int:
-        """Sample next-state index j ~ P(j | i, u_k)."""
-        rng = rng or np.random.default_rng()
-        p = self.row_block(i, k)
-        s = p.sum()
-        if s <= 0:
-            return int(i)  # no outgoing probability; stay
-        p = p / s
-        j = rng.choice(self.N, p=p)
-        return int(j)
-
-    def sim(
-        self,
-        x: Union[int, Array],
-        u: Union[int, Array],
-        return_index: bool = False,
-        rng: Optional[np.random.Generator] = None
-    ) -> Union[Array, Tuple[Array, int]]:
-        """
-        One abstract step:
-        - if x is an array -> quantize to state index; if x is int -> treat as index
-        - if u is an array -> map to input index;  if u is int -> treat as index
-        Returns the next grid-state vector (and optionally its index).
-        """
-        if isinstance(x, (int, np.integer)):
-            i = int(x)
-        else:
-            i = self.state_index_from_x(np.asarray(x, dtype=float))
-
-        if isinstance(u, (int, np.integer)):
-            k = int(u)
-        else:
-            k = self.input_index_from_u(np.asarray(u, dtype=float))
-
-        j = self.sim_index(i, k, rng=rng)
-        x_next = self.idx_to_state(j)
-        return (x_next, j) if return_index else x_next
-
-    # ===== convenience =====
-    def to_flat(self) -> Array:
-        """Return P in flat form (N, N*M)."""
-        return self._P_flat
-
-    def to_blocks(self) -> Array:
-        """Return P in block form (N, N, M)."""
-        return self._P_blocks
-
-    def block(self, k: int) -> Array:
-        """Get the k-th action block B_k (N, N) from P."""
-        return self._P_blocks[:, :, int(k)]
-
-    def block_cols(self, k: int) -> slice:
-        """Column slice [k*N : (k+1)*N] for the k-th action in flat form."""
-        N = self.N
-        return slice(k * N, (k + 1) * N)
-
-    def replace_block(self, k: int, Bk: Array) -> None:
-        """Replace the k-th action block with Bk (N, N) and update both views."""
-        Bk = np.asarray(Bk, dtype=float)
-        if Bk.shape != (self.N, self.N):
-            raise ValueError(f"Bk must be ({self.N}, {self.N})")
-        self._P_blocks[:, :, k] = Bk
-        self._P_flat[:, self.block_cols(k)] = Bk
-
-    def check_rowsum(self, atol: float = 1e-12) -> Tuple[bool, float]:
-        """Check every action block is approximately row-stochastic; return (ok, max_err)."""
-        if self.M == 0:
-            return True, 0.0
-        s = self._P_blocks.sum(axis=1)  # (N, M)
-        max_err = float(np.max(np.abs(s - 1.0)))
-        return (max_err <= atol, max_err)
