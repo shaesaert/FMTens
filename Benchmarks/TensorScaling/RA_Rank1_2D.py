@@ -88,9 +88,9 @@ sysLTI[1].AP = ['p3']
 # -----------------------
 sysAbs = {
     0: MDPModel.from_system(sysLTI[0], nx=1000, nu=5, placement='centers', u_placement='endpoints',
-                            tol=1e-19, renormalize=False, contract_sum=None),
+                            tol=1e-19, renormalize=False, contract_sum=None, compute_P = '1d'),
     1: MDPModel.from_system(sysLTI[1], nx=1000, nu=5, placement='centers', u_placement='endpoints',
-                            tol=1e-19, renormalize=False, contract_sum=None),
+                            tol=1e-19, renormalize=False, contract_sum=None, compute_P = '1d'),
 }
 
 # -----------------------
@@ -136,7 +136,6 @@ for it in range(1, T + 1):
     G.prune(0.005,'leafs')
     G.grow()
     plot_tree_layered(G)
-
 
 exit = 1
 # -----------------------

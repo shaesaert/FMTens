@@ -29,7 +29,7 @@ Dependencies: `numpy`, `polytope`, `scipy.special.erf`.
 # ===============================
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union, Literal
 
 import numpy as np
 import polytope as pc
@@ -164,6 +164,7 @@ class MDPModel:
             contract_mode: str = 'cap',
             X_bounds: Optional[Tuple[np.ndarray, np.ndarray]] = None,  # NEW
             U_bounds: Optional[Tuple[np.ndarray, np.ndarray]] = None,  # NEW
+            compute_P: Literal['1d', 'nd'] = '1d',
     ) -> 'MDPModel':
 
         """Convenience constructor: auto-build X-grid, U-grid, and P from `orig`.
@@ -204,6 +205,7 @@ class MDPModel:
             U_points = U_points.reshape(-1, 1)
 
         # 2) Transition matrix (flat by default)
+
         P = cls.transition_matrix_nd_separable(
             sys=orig,
             X_axes=X_axes,
@@ -212,6 +214,7 @@ class MDPModel:
             tol=tol,
             renormalize=renormalize,
             return_flat=return_flat,
+            mode=compute_P
         )
 
         # 3) Build the model
@@ -418,9 +421,11 @@ class MDPModel:
             tol: float = 1e-19,
             renormalize: bool = True,
             return_flat: bool = True,
+            mode: Literal['1d', 'nd'] = '1d',
     ) -> Array:
 
         import numpy as _np
+
 
         A = _np.asarray(sys.A, dtype=float)
         B = _np.asarray(sys.B, dtype=float)     # (n, m)
@@ -430,50 +435,52 @@ class MDPModel:
         sigma_z = _np.asarray(sys.Bw*Sigma_w*sys.Bw.T, dtype=float)
         mu_z = _np.asarray(sys.Bw*sys.mu, dtype=float)
 
-        # ---- grids / sizes ----
-        hx = _np.asarray(X_axes, dtype=float)[0] # state points, each grid -> column
-        hx_arr = np.asarray(hx, dtype=float).ravel()
-        mids = 0.5 * (hx_arr[:-1] + hx_arr[1:])  # (N-1,)
-        left = hx_arr[0] - 0.5 * (hx_arr[1] - hx_arr[0])
-        right = hx_arr[-1] + 0.5 * (hx_arr[-1] - hx_arr[-2])
-        #compute mx as the bounds of hx  N+1
-        mxT = np.concatenate(([left], mids, [right]))  # (N+1,)
-        mx = mxT.reshape(1,-1)
+        if mode == '1d':
+            hx = _np.asarray(X_axes, dtype=float)[0] # state points, each grid -> column
+            hx_arr = np.asarray(hx, dtype=float).ravel()
+            mids = 0.5 * (hx_arr[:-1] + hx_arr[1:])  # (N-1,)
+            left = hx_arr[0] - 0.5 * (hx_arr[1] - hx_arr[0])
+            right = hx_arr[-1] + 0.5 * (hx_arr[-1] - hx_arr[-2])
+            #compute mx as the bounds of hx  N+1
+            mxT = np.concatenate(([left], mids, [right]))  # (N+1,)
+            mx = mxT.reshape(1,-1)
 
-        XhatSpace = hx
+            XhatSpace = hx
 
-        N = hx.shape[1]
-        M = U_points.shape[1]
-        #initialize P_blocks : (N,N,M) N is number of grid points of state, M is .. of  input
-        P_blocks = np.zeros((N, N, M), dtype=float)
-        dim_i = 1
+            N = hx.shape[1]
+            M = U_points.shape[1]
+            #initialize P_blocks : (N,N,M) N is number of grid points of state, M is .. of  input
+            P_blocks = np.zeros((N, N, M), dtype=float)
+            dim_i = 1
 
-        from scipy.stats import norm
+            from scipy.stats import norm
 
-        for k in range(1, M+1):  # # loop layer (1): i1 = 1:length(uhat)=M; use k-1 for indexing
-            for index in range(1, N+1):  # loop layer (2): i2 = 1:length(XhatSpace)=N; use index-1 for indexing
-                xhat = XhatSpace[:,index-1] # "xhat = XhatSpace[:,i2]"
-                pij_ = np.array([1.0], dtype=float)
-                for d_index in range(dim_i): # loop layer (3): i3 = 1:dim_agent=1; use d_index for indexing
-                    cdf_vals = norm.cdf(mx,A[d_index]*xhat+B[d_index]*U_points[:,k-1]+mu_z[d_index],sigma_z[d_index])
-                    cpdiff = np.diff(cdf_vals)
-                    cpdiff[cpdiff<tol] = 0
-                    pij_ = np.kron(cpdiff,pij_)
-                P_blocks[index-1,:,k-1] = pij_
+            for k in range(1, M+1):  # # loop layer (1): i1 = 1:length(uhat)=M; use k-1 for indexing
+                for index in range(1, N+1):  # loop layer (2): i2 = 1:length(XhatSpace)=N; use index-1 for indexing
+                    xhat = XhatSpace[:,index-1] # "xhat = XhatSpace[:,i2]"
+                    pij_ = np.array([1.0], dtype=float)
+                    for d_index in range(dim_i): # loop layer (3): i3 = 1:dim_agent=1; use d_index for indexing
+                        cdf_vals = norm.cdf(mx,A[d_index]*xhat+B[d_index]*U_points[:,k-1]+mu_z[d_index],sigma_z[d_index])
+                        cpdiff = np.diff(cdf_vals)
+                        cpdiff[cpdiff<tol] = 0
+                        pij_ = np.kron(cpdiff,pij_)
+                    P_blocks[index-1,:,k-1] = pij_
 
-        P_blocks_t = np.zeros((N, N, M), dtype=float)
-        for k in range(1, M+1):
-            P_blocks_t[:,:,k-1] = P_blocks[:,:,k-1].T
+            P_blocks_t = np.zeros((N, N, M), dtype=float)
+            for k in range(1, M+1):
+                P_blocks_t[:,:,k-1] = P_blocks[:,:,k-1].T
 
-        if return_flat:
-            N, _, M = P_blocks_t.shape
-            P_flat = np.empty((N, N * M), dtype=P_blocks_t.dtype)
+            if return_flat:
+                N, _, M = P_blocks_t.shape
+                P_flat = np.empty((N, N * M), dtype=P_blocks_t.dtype)
 
-            for k in range(M):
-                P_flat[:, k * N: (k + 1) * N] = P_blocks_t[:, :, k]
-            return P_flat
+                for k in range(M):
+                    P_flat[:, k * N: (k + 1) * N] = P_blocks_t[:, :, k]
+                return P_flat
+            else:
+                return P_blocks_t
         else:
-            return P_blocks_t
+            raise NotImplementedError("compute_P='nd' not implemented yet (tensor path).")
 
 
     # ======================================
