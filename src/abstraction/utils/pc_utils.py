@@ -19,6 +19,9 @@ def Pc(P_flat, pol) -> np.ndarray:
     Pcomp : np.ndarray of shape (N, N)
     """
     Pprob = np.asarray(P_flat, float)  # (N, N*nu)
+    # ensure `pol` is sparse
+    if not sparse.issparse(pol):
+        pol = sparse.csr_matrix(pol)
     m, n = pol.shape                   # m = N, n = nu
 
     coo = pol.tocoo()
