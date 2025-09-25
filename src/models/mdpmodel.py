@@ -33,6 +33,10 @@ from typing import List, Optional, Tuple, Union, Literal
 
 import numpy as np
 import polytope as pc
+import warnings
+from scipy.sparse import coo_matrix
+
+from fontTools.misc.plistlib import end_array
 from scipy.special import erf as _erf  # (kept as imported in your file)
 
 Array = np.ndarray
@@ -246,6 +250,45 @@ class MDPModel:
         return self._P_flat
 
     # =====================
+    # Tensor asbtraction utilities
+    # =====================
+    import numpy as np
+    from typing import Optional, Sequence
+
+    @staticmethod
+    def combvec_first_fast(*axes):
+        """
+        Cartesian product columns with FIRST axis varying fastest.
+        Returns array of shape (k, N), where k=len(axes), N=∏ len(axes[i]).
+        """
+        # make sure each axis is a 1-D numpy array
+        axes = [np.asarray(a).ravel() for a in axes]
+        # meshgrid with 'ij' indexing gives a grid per axis
+        grids = np.meshgrid(*axes, indexing='ij')
+        # reshape each grid column-wise (Fortran order) so the first axis cycles fastest
+        return np.vstack([g.reshape(-1, order='F') for g in grids])
+
+    @staticmethod
+    def f_det(sys,x,u):
+        x_n = sys.A @ x + sys.B @ u
+        return x_n
+
+    @staticmethod
+    def repmat_vector_col(vec: np.ndarray, n_cols: int) -> np.ndarray:
+            """
+            Take ONE column vector (shape (m,) or (m,1)) and replicate it across columns.
+            Returns an array of shape (m, n_cols).
+            """
+            v = np.asarray(vec)
+            if v.ndim == 1:
+                v = v.reshape(-1, 1)  # (m,1)
+            elif v.ndim == 2 and v.shape[1] != 1:
+                raise ValueError("vec must be a single column: (m,) or (m,1).")
+            m = v.shape[0]
+            return np.broadcast_to(v, (m, n_cols)).copy()
+
+
+    # =====================
     # Grid utilities
     # =====================
     @staticmethod
@@ -432,12 +475,15 @@ class MDPModel:
         Bw = _np.asarray(sys.Bw, dtype=float)
         mu_w = _np.asarray(sys.mu, dtype=float).reshape(-1, 1)
         Sigma_w = _np.asarray(sys.sigma, dtype=float)
-        sigma_z = _np.asarray(sys.Bw*Sigma_w*sys.Bw.T, dtype=float)
-        mu_z = _np.asarray(sys.Bw*sys.mu, dtype=float)
+
 
         if mode == '1d':
+            # transform state space
+            sigma_z = _np.asarray(sys.Bw * Sigma_w * sys.Bw.T, dtype=float)
+            mu_z = _np.asarray(sys.Bw * sys.mu, dtype=float)
             hx = _np.asarray(X_axes, dtype=float)[0] # state points, each grid -> column
             hx_arr = np.asarray(hx, dtype=float).ravel()
+            # compute uniform grids
             mids = 0.5 * (hx_arr[:-1] + hx_arr[1:])  # (N-1,)
             left = hx_arr[0] - 0.5 * (hx_arr[1] - hx_arr[0])
             right = hx_arr[-1] + 0.5 * (hx_arr[-1] - hx_arr[-2])
@@ -480,6 +526,100 @@ class MDPModel:
             else:
                 return P_blocks_t
         else:
+            # ------ transform state space ------
+            dim_i = len(X_axes)
+            Sigma = Bw @ Sigma_w @ Bw.T  # (2,2)
+
+            # SVD: NumPy returns U, singular_vals, Vh  (Vh = V^T)
+            Uz, s, Vh = np.linalg.svd(Sigma, full_matrices=False)
+            Sz =  np.diag(s)
+            sigma_z = np.diag(Sz)
+            mu_z = Uz.T @ Bw @ mu_w
+
+            if np.sum(np.abs(mu_z)) > 0:
+                warnings.warn("Implementation does not hold for mu not equal to zero", UserWarning)
+
+            V_z = np.asarray(pc.extreme(sys.X))  # (n_vert, 2)
+            V_z2 = (Uz.T @ V_z.T).T  # map each vertex
+            Z = pc.qhull(V_z2)
+
+            Ver_Z= np.asarray(pc.extreme(Z))  # (n_vertices, n_dim)
+            Zl = Ver_Z.min(axis=0)  # per-dimension mins
+            Zu = Ver_Z.max(axis=0)
+
+            # TODO(optional)@Ruohan: add nonuniform state gridding
+
+            # ---- compute uniform grid ----
+            l = np.array([ax.shape[1] for ax in X_axes], dtype=int)
+            gridSize = (Zu - Zl) / l
+            #[DONE]TODO@Ruohan: select representative points in each in dim_i
+
+            hz = np.array([np.asarray(ax).ravel() for ax in X_axes], dtype=object)
+            # hz = np.empty(dim_i, dtype=object)
+            # for i in range(dim_i):
+            #     hz[i] = np.asarray(X_axes[i])
+            # compute cartesian product of all states in a desired axis varying rate: h[0] vary first, h[1] next,..
+            ZhatSpace = MDPModel.combvec_first_fast(*hz)
+            XhatSpace = Uz @ ZhatSpace
+
+            #[DONE]TODO@Ruohan: compute deterministic probability matrix P_det (sparse)
+            nXhatSpace = XhatSpace.shape[1]
+            nUhat = U_points.shape[1]
+            index_total = np.arange(ZhatSpace.shape[1], dtype=int)[None, :]
+            i_indices = np.empty((1, 0), dtype=int)  # 1×0 row
+            j_indices = np.empty((1, 0), dtype=int)
+            for k in range(nUhat):
+                z_n = Uz.T @ MDPModel.f_det(sys, XhatSpace, MDPModel.repmat_vector_col(U_points[:,k], n_cols=nXhatSpace) )
+                gridSize_inv = 1.0 / gridSize
+                diag_gridSize_inv = np.diag(gridSize_inv)
+                Zl_T = Zl[:, None]
+                diff_zn = z_n - Zl_T
+                z_n_ind = np.zeros((dim_i,1),dtype=int) + np.floor(diag_gridSize_inv @ diff_zn)
+                l_T = l[:, None]
+                valid = (z_n_ind >= 0) & (z_n_ind <= (l - 1)[:, None])
+                indices = np.all(valid, axis=0)
+                indices = indices.reshape(1, -1)
+                mask = np.ravel(indices).astype(bool)  # shape (N,)
+                zi_indices_2T = [z_n_ind[d, mask] for d in range(dim_i)]
+                zi_indices = [np.asarray(zi, dtype=np.int64).reshape(1, -1) for zi in zi_indices_2T]
+                lin0 = np.ravel_multi_index((zi_indices[0], zi_indices[1]),dims=tuple(l), order='F')
+                i_indices = np.hstack((i_indices, lin0))
+                cols = index_total.ravel()[np.ravel(indices).astype(bool)]+ k * nXhatSpace
+                cols_row = cols.reshape(1, -1)
+                j_indices = np.hstack((j_indices, cols_row))
+
+
+
+            rows = np.asarray(i_indices, dtype=int).ravel()
+            cols = np.asarray(j_indices, dtype=int).ravel()
+
+            data = np.ones(rows.size, dtype=float)
+            P_det = coo_matrix((data, (rows, cols)), shape=(nXhatSpace, nXhatSpace * nUhat)).tocsr()
+
+
+            #[DONE]TODO@Ruohan: compute stochastic probability matrix Pstoch
+            mx2 = [((np.arange(int(li) + 1) - 0.5) * float(gs)).reshape(1, -1) for gs, li in zip(gridSize, l)]
+            from scipy.stats import norm
+            from scipy.linalg import toeplitz
+            P = []  # Python list = MATLAB cell
+            for d in range(dim_i):
+                edges = np.asarray(mx2[d]).ravel()  # (L_d+1,)
+                mu = float(np.asarray(mu_z).ravel()[d])
+                sig = float(np.asarray(sigma_z).ravel()[d])
+
+                cdf = norm.cdf(edges, loc=mu, scale=sig)  # (L_d+1,)
+                cp = np.diff(cdf)  # (L_d,)
+
+                cp[cp < tol] = 0.0
+
+                P_d = toeplitz(cp)  # (L_d, L_d)
+                P.append(P_d)
+
+
+            #TODO@Ruohan: feed P_det and list of Pstoch into tensor toolbox
+            exit  = 1
+
+
             raise NotImplementedError("compute_P='nd' not implemented yet (tensor path).")
 
 

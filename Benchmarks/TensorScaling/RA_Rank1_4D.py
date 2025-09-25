@@ -104,17 +104,17 @@ sysLTI[1].AP = ['p3']
 # -----------------------
 
 # sysAbs = {
-#     0: MDPModel.from_system(sysLTI[0], nx=[40,10], nu=5, placement='centers', u_placement='endpoints',
+#     0: MDPModel.from_system(sysLTI[0], nx=[40,10], nu=10, placement='centers', u_placement='endpoints',
 #                             tol=1e-19, renormalize=False, contract_sum=None, TensorComputation = 'nd'),
 #                                                         #TensorComputation = 'tensor' after implemented
-#     1: MDPModel.from_system(sysLTI[1], nx=[40,10], nu=5, placement='centers', u_placement='endpoints',
+#     1: MDPModel.from_system(sysLTI[1], nx=[40,10], nu=10, placement='centers', u_placement='endpoints',
 #                             tol=1e-19, renormalize=False, contract_sum=None, TensorComputation = 'nd'),
 # }
 
 # dumb formatting for debugging convenience
-abs0 = MDPModel.from_system(sysLTI[0], nx=[40,10], nu=5, placement='centers', u_placement='endpoints',
+abs0 = MDPModel.from_system(sysLTI[0], nx=[40,10], nu=10, placement='centers', u_placement='endpoints',
                             tol=1e-19, renormalize=False, contract_sum=None, compute_P = 'nd'),
-abs1 = MDPModel.from_system(sysLTI[1], nx=[40,10], nu=5, placement='centers', u_placement='endpoints',
+abs1 = MDPModel.from_system(sysLTI[1], nx=[40,10], nu=10, placement='centers', u_placement='endpoints',
                             tol=1e-19, renormalize=False, contract_sum=None, compute_P = 'nd'),
 sysAbs = {0: abs0, 1: abs1}
 
