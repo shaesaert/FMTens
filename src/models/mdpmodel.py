@@ -33,8 +33,12 @@ from typing import List, Optional, Tuple, Union, Literal
 
 import numpy as np
 import polytope as pc
+from polytope import qhull
 import warnings
+
+from scipy._lib.array_api_compat import torch
 from scipy.sparse import coo_matrix
+from itertools import product
 
 from fontTools.misc.plistlib import end_array
 from scipy.special import erf as _erf  # (kept as imported in your file)
@@ -96,18 +100,20 @@ class MDPModel:
     # Constructors / initializers
     # =============================
     def __init__(
-        self,
-        P: Array,
-        hx: List[Array],
-        states: Optional[Array] = None,
-        beta: Optional[Array] = None,
-        orig: Optional[object] = None,
-        inputs: Optional[Array] = None,
-        labels: Optional[list] = None,
+            self,
+            P: Array,
+            hx: List[Array],
+            states: Optional[Array] = None,
+            beta: Optional[Array] = None,
+            orig: Optional[object] = None,
+            inputs: Optional[Array] = None,
+            labels: Optional[list] = None,
     ):
-        # store basics
+        # -------------------------
+        # grid / sizes
+        # -------------------------
         self.hx = [np.asarray(ax, dtype=float).ravel() for ax in hx]
-        self.l = tuple(len(ax) for ax in self.hx)
+        self.l = tuple(len(ax) for ax in self.hx)  # bins per dim
         self.dim = len(self.hx)
 
         # states
@@ -125,30 +131,117 @@ class MDPModel:
         else:
             self.inputs = None
 
-        # transition formats
-        P = np.asarray(P, dtype=float)
-        if P.ndim == 2:
-            self._P_flat = P
-            N = self.states.shape[0]
-            self._P_blocks = _blocks_from_flat(P, N)
-        elif P.ndim == 3:
-            self._P_blocks = P
-            self._P_flat = _flat_from_blocks(P)
-        else:
-            raise ValueError("P must be (N, N*M) or (N, N, M).")
-        self.P = self._P_flat  # public alias
+        # -------------------------
+        # transitions
+        # -------------------------
+        # prepare fields so they exist in all cases
+        self._P_flat = None  # dense (N, N*M)
+        self._P_blocks = None  # dense (N, N, M)
+        self.P_det = None  # present when operator is provided
+        self.Pi = None  # list of per-dimension kernels when operator
+        self.P = None  # public alias: dense array OR operator
 
+        # Case A: classic numeric (1D) — same behavior as before
+        if isinstance(P, np.ndarray):
+            P_arr = np.asarray(P, dtype=float)
+            if P_arr.ndim == 2:
+                self._P_flat = P_arr
+                N = self.states.shape[0]
+                self._P_blocks = _blocks_from_flat(P_arr, N)
+            elif P_arr.ndim == 3:
+                self._P_blocks = P_arr
+                self._P_flat = _flat_from_blocks(P_arr)
+            else:
+                raise ValueError("Dense P must be shape (N, N*M) or (N, N, M).")
+            self.P = self._P_flat  # keep old public alias for 1D/dense
+
+        # Case B: 2D tensor operator object (duck-typed: must expose P_det, dim, l, Pi)
+        elif all(hasattr(P, attr) for attr in ("P_det", "dim", "l", "Pi")):
+            # store operator directly
+            self.P = P
+            # mirror helpful fields for convenience
+            self.P_det = P.P_det
+            try:
+                self.l = tuple(int(v) for v in np.asarray(P.l).ravel())
+            except Exception:
+                # fall back to l derived from hx if operator.l is not cleanly coercible
+                pass
+            self.Pi = list(P.Pi)
+
+        else:
+            raise TypeError(
+                "P must be either a dense numpy array with shape (N, N*M)/(N, N, M) "
+                "or a TensorTransitionProbability_2D-like object exposing P_det, dim, l, Pi."
+            )
+
+        # -------------------------
         # other props
+        # -------------------------
         self.beta = beta
         self.orig = orig
         self.labels = labels
 
-        # outputs = C @ states' if possible
+        # outputs = C @ states if available
         if self.orig is not None and hasattr(self.orig, "C"):
             C = np.asarray(self.orig.C, dtype=float)
             self.outputs = (C @ self.states.T).T
         else:
             self.outputs = None
+
+    # def __init__(
+    #     self,
+    #     P: Array,
+    #     hx: List[Array],
+    #     states: Optional[Array] = None,
+    #     beta: Optional[Array] = None,
+    #     orig: Optional[object] = None,
+    #     inputs: Optional[Array] = None,
+    #     labels: Optional[list] = None,
+    # ):
+    #     # store basics
+    #     self.hx = [np.asarray(ax, dtype=float).ravel() for ax in hx]
+    #     self.l = tuple(len(ax) for ax in self.hx)
+    #     self.dim = len(self.hx)
+    #
+    #     # states
+    #     if states is None:
+    #         self.states = _cartesian_from_axes(self.hx)  # (N, n)
+    #     else:
+    #         self.states = np.asarray(states, dtype=float).reshape(-1, self.dim)
+    #
+    #     # inputs
+    #     if inputs is not None:
+    #         U = np.asarray(inputs, dtype=float)
+    #         if U.ndim == 1:
+    #             U = U.reshape(-1, 1)
+    #         self.inputs = U  # (M, m)
+    #     else:
+    #         self.inputs = None
+    #
+    #     # transition formats
+    #     P = np.asarray(P, dtype=float)
+    #     if P.ndim == 2:
+    #         self._P_flat = P
+    #         N = self.states.shape[0]
+    #         self._P_blocks = _blocks_from_flat(P, N)
+    #     elif P.ndim == 3:
+    #         self._P_blocks = P
+    #         self._P_flat = _flat_from_blocks(P)
+    #     else:
+    #         raise ValueError("P must be (N, N*M) or (N, N, M).")
+    #     self.P = self._P_flat  # public alias
+    #
+    #     # other props
+    #     self.beta = beta
+    #     self.orig = orig
+    #     self.labels = labels
+    #
+    #     # outputs = C @ states' if possible
+    #     if self.orig is not None and hasattr(self.orig, "C"):
+    #         C = np.asarray(self.orig.C, dtype=float)
+    #         self.outputs = (C @ self.states.T).T
+    #     else:
+    #         self.outputs = None
 
     # --------- classmethod: build from continuous system ---------
     @classmethod
@@ -168,7 +261,7 @@ class MDPModel:
             contract_mode: str = 'cap',
             X_bounds: Optional[Tuple[np.ndarray, np.ndarray]] = None,  # NEW
             U_bounds: Optional[Tuple[np.ndarray, np.ndarray]] = None,  # NEW
-            compute_P: Literal['1d', 'nd'] = '1d',
+            compute_P: Literal['1d', '2d','nd'] = '1d',
     ) -> 'MDPModel':
 
         """Convenience constructor: auto-build X-grid, U-grid, and P from `orig`.
@@ -209,20 +302,41 @@ class MDPModel:
             U_points = U_points.reshape(-1, 1)
 
         # 2) Transition matrix (flat by default)
+        if compute_P == '1d':
+            P = cls.transition_matrix_nd_separable(
+                sys=orig,
+                X_axes=X_axes,
+                U_points=U_points,
+                X_poly=orig.X,
+                tol=tol,
+                renormalize=renormalize,
+                return_flat=return_flat,
+                mode=compute_P
+                )
+            mdp = cls(P=P, hx=X_axes, states=X_points, orig=orig, inputs=U_points)
+            mdp.outputs = mdp.orig.C @ X_points
 
-        P = cls.transition_matrix_nd_separable(
-            sys=orig,
-            X_axes=X_axes,
-            U_points=U_points,
-            X_poly=orig.X,
-            tol=tol,
-            renormalize=renormalize,
-            return_flat=return_flat,
-            mode=compute_P
-        )
+        elif compute_P == '2d':
+            (tP_2d, hz, XhatSpace, beta, sys_ret, ZhatSpace, Uz)= cls.transition_matrix_nd_separable(
+                sys=orig,
+                X_axes=X_axes,
+                U_points=U_points,
+                X_poly=orig.X,
+                tol=tol,
+                renormalize=renormalize,
+                return_flat=return_flat,
+                mode=compute_P
+                )
+            tP_2d.dim = 2
+            tP_2d.l = np.array([tP_2d.l1, tP_2d.l2], dtype=int)
+            mdp = cls(P=tP_2d, hx=hz, states=XhatSpace, beta=beta, orig=sys_ret, inputs=U_points)
+            mdp.zstates = ZhatSpace  # transformed grid in Z-space
+            mdp.Uz = Uz
+            mdp.outputs = mdp.orig.C @ XhatSpace
+            mdp.outputmap = mdp.orig.C @ Uz
 
-        # 3) Build the model
-        mdp = cls(P=P, hx=X_axes, states=X_points, orig=orig, inputs=U_points)
+        elif compute_P == 'nd':
+            raise NotImplementedError("compute_P='n>2 d' not implemented yet (tensor path).")
 
         # 4) Optional sub-stochastic row capping (per action block)
         if contract_sum is not None:
@@ -254,6 +368,18 @@ class MDPModel:
     # =====================
     import numpy as np
     from typing import Optional, Sequence
+
+    @staticmethod
+    def linear_image_vertices(P, M):
+        # P: polytope.Polytope with H-rep but we use vertices
+        V = np.array([np.asarray(v).ravel() for v in pc.extreme(P)])  # (Nv, n)
+        Vimg = (M @ V.T).T  # map vertices
+        return pc.qhull(Vimg)
+
+    @staticmethod
+    def ff2n(dim: int) -> np.ndarray:
+        """Python equivalent of MATLAB ff2n(dim): 2^dim-by-dim matrix with levels {0,1}."""
+        return np.array(list(product([0, 1], repeat=dim)), dtype=int)
 
     @staticmethod
     def combvec_first_fast(*axes):
@@ -464,7 +590,7 @@ class MDPModel:
             tol: float = 1e-19,
             renormalize: bool = True,
             return_flat: bool = True,
-            mode: Literal['1d', 'nd'] = '1d',
+            mode: Literal['1d', '2d', 'nd'] = '1d',
     ) -> Array:
 
         import numpy as _np
@@ -617,10 +743,25 @@ class MDPModel:
 
 
             #TODO@Ruohan: feed P_det and list of Pstoch into tensor toolbox
-            exit  = 1
+            #[DONE] for 2d
+            #[  ] for n>2 d
+            from .utils.TensorTransitionProbability_2D import TensorTransitionProbability_2D
+            if mode == '2d':
+                tP_2d = TensorTransitionProbability_2D(l, P_det, P[0], P[1])
+            else:
+                raise NotImplementedError("compute_P='n>2 d' not implemented yet (tensor path).")
+
+            ff2n_comp_T = (MDPModel.ff2n(dim_i)-0.5).T
+            poly_v = (np.diag(2*gridSize) @ ff2n_comp_T ).T
+            p_V = np.asarray(poly_v)  # shape (4, 2) vertices
+            poly_comp = qhull(p_V)
+            beta = MDPModel.linear_image_vertices(poly_comp, Uz)
+            return tP_2d, hz, XhatSpace, beta, sys, ZhatSpace, Uz
 
 
-            raise NotImplementedError("compute_P='nd' not implemented yet (tensor path).")
+
+
+
 
 
     # ======================================

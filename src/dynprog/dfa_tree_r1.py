@@ -72,9 +72,35 @@ class DFATree:
         """Return DFA state (0-based) stored on node n."""
         return int(self.tree.nodes[n]["q"])
 
+    # def _nu_of_dim(self, d: int) -> int:
+    #     """Number of actions for dimension d inferred from flat transition shape."""
+    #     P_flat = np.asarray(getattr(self.sysAbs[d], "P"), dtype=float)  # (N, N*nu)
+    #     N, NU = P_flat.shape
+    #     if NU % N != 0:
+    #         raise ValueError(f"P must be (N, N*nu); got {P_flat.shape}")
+    #     return NU // N
+
     def _nu_of_dim(self, d: int) -> int:
-        """Number of actions for dimension d inferred from flat transition shape."""
-        P_flat = np.asarray(getattr(self.sysAbs[d], "P"), dtype=float)  # (N, N*nu)
+        """
+        Number of actions for dimension d inferred from the transition container.
+
+        Supports:
+          - 1D: self.sysAbs[d].P is a dense ndarray shaped (N, N*nu)
+          - 2D/tensor: self.sysAbs[d].P is an object exposing .P_det (sparse/dense)
+        """
+        Pobj = getattr(self.sysAbs[d], "P")
+
+        # 2D/tensor wrapper: use its P_det
+        if hasattr(Pobj, "P_det"):
+            P_det = Pobj.P_det  # may be scipy.sparse or ndarray
+            # get shape without forcing dense
+            N, NU = P_det.shape
+            if NU % N != 0:
+                raise ValueError(f"P_det must be (N, N*nu); got {P_det.shape}")
+            return NU // N
+
+        # 1D dense path (unchanged)
+        P_flat = np.asarray(Pobj, dtype=float)  # (N, N*nu)
         N, NU = P_flat.shape
         if NU % N != 0:
             raise ValueError(f"P must be (N, N*nu); got {P_flat.shape}")

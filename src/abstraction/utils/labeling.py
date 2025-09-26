@@ -250,7 +250,11 @@ def dim_label(sysAbs, sysLTI, letters, visualize=False, outdir=None, prefix="L")
         lti_k = get_lti(k)
 
         # 1) axis from hx
-        xax_k = _axis_from_hx(mdp_k.hx)
+        ## label states
+        #xax_k = _axis_from_hx(mdp_k.hx)
+        ## label outputs
+        xax_k = _axis_from_hx(mdp_k.outputs)
+
 
         # 2) AP sets and 1D region intervals
         aps_set = set(getattr(lti_k, "AP", []))

@@ -103,19 +103,58 @@ sysLTI[1].AP = ['p3']
 # Abstraction
 # -----------------------
 
-# sysAbs = {
-#     0: MDPModel.from_system(sysLTI[0], nx=[40,10], nu=10, placement='centers', u_placement='endpoints',
-#                             tol=1e-19, renormalize=False, contract_sum=None, TensorComputation = 'nd'),
-#                                                         #TensorComputation = 'tensor' after implemented
-#     1: MDPModel.from_system(sysLTI[1], nx=[40,10], nu=10, placement='centers', u_placement='endpoints',
-#                             tol=1e-19, renormalize=False, contract_sum=None, TensorComputation = 'nd'),
-# }
+sysAbs = {
+    0: MDPModel.from_system(sysLTI[0], nx=[40,10], nu=10, placement='centers', u_placement='endpoints',
+                            tol=1e-19, renormalize=False, contract_sum=None, compute_P = '2d'),
+                                                        #TensorComputation = 'tensor' after implemented
+    1: MDPModel.from_system(sysLTI[1], nx=[40,10], nu=10, placement='centers', u_placement='endpoints',
+                            tol=1e-19, renormalize=False, contract_sum=None, compute_P = '2d'),
+}
 
-# dumb formatting for debugging convenience
-abs0 = MDPModel.from_system(sysLTI[0], nx=[40,10], nu=10, placement='centers', u_placement='endpoints',
-                            tol=1e-19, renormalize=False, contract_sum=None, compute_P = 'nd'),
-abs1 = MDPModel.from_system(sysLTI[1], nx=[40,10], nu=10, placement='centers', u_placement='endpoints',
-                            tol=1e-19, renormalize=False, contract_sum=None, compute_P = 'nd'),
-sysAbs = {0: abs0, 1: abs1}
+# -----------------------
+# Labeling
+# -----------------------
+L = dim_label(sysAbs, sysLTI, letters, visualize=True)
+
+# -----------------------
+# Policy (randomized uniform) & rho
+# -----------------------
+nInputs = [10,10]
+dims = sorted(sysAbs.keys())          # e.g. [0, 1, ...]
+nx   = [sysAbs[d].N for d in dims]    # states per dim
+nu   = [nInputs[d] for d in dims]    # actions per dim
+nQ   = len(DFA.S)                     # #DFA states (0-based)
+
+# randomized policy: for every DFA state q and dimension d,
+# use a uniform distribution over actions at every state i
+pol = [
+    [np.full((nx[d], nu[d]), 1.0/nu[d], dtype=float) for d in range(len(dims))]
+    for _ in range(nQ)
+]
+
+# sampling rho: uniform over states in each dimension
+rho = [np.full(nx[d], 1.0/nx[d], dtype=float) for d in range(len(dims))]
+
+# -----------------------
+# Tree
+# -----------------------
+# 1) Initialization
+nx_list = [sysAbs[k].N for k in sorted(sysAbs.keys())]
+L_list  = [L[k]       for k in sorted(sysAbs.keys())]
+G = DFATree(DFA, sysAbs, pol, nx_list, L_list)
+G.initiate()
+plot_tree_layered(G)
+
+# 2) Grow tree
+#TODO@Ruohan: needs inspection 1) how to use sprase P.P_det;
+#                              2) how to multiply value functions (appearing in maxpolicy, etc.)
+T = 5
+# for it in range(1, T + 1):
+#     print(f"\n=== Iteration {it} ===")
+#     G.maxpolicy(rho)
+#     G.update_tree()
+#     G.prune(0.005,'leafs')
+#     G.grow()
+#     plot_tree_layered(G)
 
 exit = 1
