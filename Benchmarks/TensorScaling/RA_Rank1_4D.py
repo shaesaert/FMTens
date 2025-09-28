@@ -146,15 +146,13 @@ G.initiate()
 plot_tree_layered(G)
 
 # 2) Grow tree
-#TODO@Ruohan: needs inspection 1) how to use sprase P.P_det;
-#                              2) how to multiply value functions (appearing in maxpolicy, etc.)
-T = 5
-# for it in range(1, T + 1):
-#     print(f"\n=== Iteration {it} ===")
-#     G.maxpolicy(rho)
-#     G.update_tree()
-#     G.prune(0.005,'leafs')
-#     G.grow()
-#     plot_tree_layered(G)
+T = 10
+for it in range(1, T + 1):
+    print(f"\n=== Iteration {it} ===")
+    G.maxpolicy(rho)
+    G.update_tree()
+    G.prune(0.005,'leafs')
+    G.grow()
+    plot_tree_layered(G)
 
 exit = 1

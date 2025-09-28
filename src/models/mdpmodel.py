@@ -1,27 +1,93 @@
 # -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """
-MDPModel (merged): discrete MDP abstraction that can **self-build** its grids and
-transition matrices from a continuous system, so your main can be as simple as:
+MDPModel
+========
+A lightweight, self-contained abstraction of a **discrete** Markov Decision Process
+that can be *built directly from a continuous system*. The class constructs
+state and input grids and computes the transition probabilities internally,
+so the caller only specifies grid sizes and a few options. This keeps your
+application code short and readable while remaining explicit about numerical
+choices.
+
+What this module provides
+-------------------------
+- `MDPModel.from_system(...)`: end-to-end constructor that:
+  1) builds uniform grids for the state space `X` and input space `U`,
+  2) computes the transition matrix `P` using separable Gaussian kernels,
+  3) optionally caps/renormalizes rows to be (sub-)stochastic.
+- Static helpers for gridding and tensorized transitions:
+  `make_uniform_grid`, `_cartesian_from_axes`, `_flat_from_blocks`,
+  `_blocks_from_flat`, and `transition_matrix_nd_separable(...)`.
+- Optional sub-stochastic row capping via `apply_substochastic(target, mode)`
+  (useful when you want ≤1 mass per row after truncation).
+
+Typical use
+-----------
+If you have a continuous linear system with fields
+`A, B, Bw, mu, sigma, X (polytope), U (polytope), C`, you can do:
 
     sysAbs = {
-        0: MDPModel.from_system(sysLTI[0], nx=1000, nu=5, placement='centers',
-                                tol=1e-15, renormalize=True, contract_sum=1.0),
-        1: MDPModel.from_system(sysLTI[1], nx=1000, nu=5, placement='centers',
-                                tol=1e-15, renormalize=True, contract_sum=1.0),
+        0: MDPModel.from_system(sysLTI[0], nx=1000, nu=5,
+                                placement='centers',
+                                tol=1e-15,
+                                renormalize=False,
+                                contract_sum=1.0),
+        1: MDPModel.from_system(sysLTI[1], nx=1000, nu=5,
+                                placement='centers',
+                                tol=1e-15,
+                                renormalize=False,
+                                contract_sum=1.0),
     }
 
-This file **merges** utilities previously in `ugrid_util.py` and `Psas.py` into the
-class, so you don't need to import them separately.
+By default, `compute_P='1d'` builds a flat `(N, N*M)` matrix. You may also
+request a tensor/operator path with `compute_P='2d'` for 2-D systems, which
+exposes per-dimension kernels and a sparse deterministic shift operator.
 
-Highlights
----------
-- `MDPModel.from_system(...)` builds X-grid and U-grid and computes P internally.
-- `make_uniform_grid` and the separable Gaussian transition builder are included
-  as static methods on the class.
-- Supports both flat `(N, N*M)` and block `(N, N, M)` forms internally.
-- Optional sub-stochastic row capping via `contract_sum` (like your renorm step).
+Key options (high level)
+------------------------
+- `nx`, `nu`: grid counts per state/input dimension (int or sequence).
+- `placement`: `'centers' | 'endpoints'` (and `u_placement` override for inputs);
+  a `'log'` option is supported for inputs in special cases.
+- `filter_inside`: keep only grid points inside the given polytope/bounds.
+- `tol`: probability mass below this threshold is truncated to zero.
+- `renormalize`: per (row,action) normalization after truncation.
+- `contract_sum`: cap or set each row-sum to a target (e.g., `1.0` or `0.999`).
+- `return_flat`: choose flat `(N, N*M)` vs. block `(N, N, M)` storage.
+- `compute_P`: `'1d' | '2d'` (tensor path for 2-D; `'nd'` placeholder).
 
-Dependencies: `numpy`, `polytope`, `scipy.special.erf`.
+Shapes & conventions
+--------------------
+- State grid `states`: `(N, n)` with Fortran-style (column-major) reshaping for
+  consistent block layout.
+- Inputs `inputs`: `(M, m)`; `M` discrete inputs of dimension `m`.
+- Transitions:
+  - Flat view: `P_flat` with shape `(N, N*M)`, action blocks concatenated in
+    **Fortran** order.
+  - Block view: `P_blocks` with shape `(N, N, M)`, where `P_blocks[:, :, u]`
+    is the `(N×N)` kernel for the `u`-th input.
+- Outputs `outputs`: computed as `C @ states.T` when `orig.C` is available.
+
+When to use this abstraction
+----------------------------
+- You need a reproducible, explicit discretization of a stochastic LTI system.
+- You want to carry both a friendly flat matrix (for legacy MATLAB/NumPy code)
+  and a tensor/operator form (for structure-exploiting solvers).
+- You need fine control over row sums (renormalization vs. sub-stochastic capping).
+
+Assumptions & scope
+-------------------
+- The transition builder uses **separable Gaussian** noise injected through `Bw`,
+  with mean `mu` and covariance `sigma` (see code for details). Non-Gaussian,
+  non-separable kernels are out of scope here.
+- The `'2d'` tensor path targets 2-D systems; `'nd'` is a reserved placeholder.
+- Polytopes are expected to be bounded; bounds tuples/arrays are also supported.
+
+Dependencies
+------------
+`numpy`, `polytope`, `scipy.special.erf`, and selected utilities from SciPy
+(sparse matrices, statistics, linear algebra).
+
 """
 
 # ===============================
@@ -141,7 +207,7 @@ class MDPModel:
         self.Pi = None  # list of per-dimension kernels when operator
         self.P = None  # public alias: dense array OR operator
 
-        # Case A: classic numeric (1D) — same behavior as before
+        # Case A: classic numeric (1D) — easy behaviour
         if isinstance(P, np.ndarray):
             P_arr = np.asarray(P, dtype=float)
             if P_arr.ndim == 2:
@@ -171,7 +237,7 @@ class MDPModel:
         else:
             raise TypeError(
                 "P must be either a dense numpy array with shape (N, N*M)/(N, N, M) "
-                "or a TensorTransitionProbability_2D-like object exposing P_det, dim, l, Pi."
+                "or a tensor_transition_probability_2d-like object exposing P_det, dim, l, Pi."
             )
 
         # -------------------------
@@ -188,61 +254,6 @@ class MDPModel:
         else:
             self.outputs = None
 
-    # def __init__(
-    #     self,
-    #     P: Array,
-    #     hx: List[Array],
-    #     states: Optional[Array] = None,
-    #     beta: Optional[Array] = None,
-    #     orig: Optional[object] = None,
-    #     inputs: Optional[Array] = None,
-    #     labels: Optional[list] = None,
-    # ):
-    #     # store basics
-    #     self.hx = [np.asarray(ax, dtype=float).ravel() for ax in hx]
-    #     self.l = tuple(len(ax) for ax in self.hx)
-    #     self.dim = len(self.hx)
-    #
-    #     # states
-    #     if states is None:
-    #         self.states = _cartesian_from_axes(self.hx)  # (N, n)
-    #     else:
-    #         self.states = np.asarray(states, dtype=float).reshape(-1, self.dim)
-    #
-    #     # inputs
-    #     if inputs is not None:
-    #         U = np.asarray(inputs, dtype=float)
-    #         if U.ndim == 1:
-    #             U = U.reshape(-1, 1)
-    #         self.inputs = U  # (M, m)
-    #     else:
-    #         self.inputs = None
-    #
-    #     # transition formats
-    #     P = np.asarray(P, dtype=float)
-    #     if P.ndim == 2:
-    #         self._P_flat = P
-    #         N = self.states.shape[0]
-    #         self._P_blocks = _blocks_from_flat(P, N)
-    #     elif P.ndim == 3:
-    #         self._P_blocks = P
-    #         self._P_flat = _flat_from_blocks(P)
-    #     else:
-    #         raise ValueError("P must be (N, N*M) or (N, N, M).")
-    #     self.P = self._P_flat  # public alias
-    #
-    #     # other props
-    #     self.beta = beta
-    #     self.orig = orig
-    #     self.labels = labels
-    #
-    #     # outputs = C @ states' if possible
-    #     if self.orig is not None and hasattr(self.orig, "C"):
-    #         C = np.asarray(self.orig.C, dtype=float)
-    #         self.outputs = (C @ self.states.T).T
-    #     else:
-    #         self.outputs = None
-
     # --------- classmethod: build from continuous system ---------
     @classmethod
     def from_system(
@@ -255,7 +266,7 @@ class MDPModel:
             u_placement: Optional[str] = None,
             filter_inside: bool = True,
             tol: float = 1e-15,
-            renormalize: bool = True,
+            renormalize: bool = False,
             return_flat: bool = True,
             contract_sum: Optional[float] = None,
             contract_mode: str = 'cap',
@@ -301,7 +312,7 @@ class MDPModel:
         if U_points.ndim == 1:
             U_points = U_points.reshape(-1, 1)
 
-        # 2) Transition matrix (flat by default)
+        # 2) Transition matrix (if by default: compute one flattened matrix, works for 1d case)
         if compute_P == '1d':
             P = cls.transition_matrix_nd_separable(
                 sys=orig,
@@ -316,7 +327,7 @@ class MDPModel:
             mdp = cls(P=P, hx=X_axes, states=X_points, orig=orig, inputs=U_points)
             mdp.outputs = mdp.orig.C @ X_points
 
-        elif compute_P == '2d':
+        elif compute_P == '2d': # if indicated '2d': tensor computation
             (tP_2d, hz, XhatSpace, beta, sys_ret, ZhatSpace, Uz)= cls.transition_matrix_nd_separable(
                 sys=orig,
                 X_axes=X_axes,
@@ -678,22 +689,26 @@ class MDPModel:
             # ---- compute uniform grid ----
             l = np.array([ax.shape[1] for ax in X_axes], dtype=int)
             gridSize = (Zu - Zl) / l
-            #[DONE]TODO@Ruohan: select representative points in each in dim_i
-
-            hz = np.array([np.asarray(ax).ravel() for ax in X_axes], dtype=object)
-            # hz = np.empty(dim_i, dtype=object)
-            # for i in range(dim_i):
-            #     hz[i] = np.asarray(X_axes[i])
+            # select representative points in each in dim_i
+            hz = [(Zl[d] + (0.5 + np.arange(l[d])) * gridSize[d]).reshape(1, -1) for d in range(dim_i)]
+            #hz = np.array([np.asarray(ax).ravel() for ax in X_axes], dtype=object)
             # compute cartesian product of all states in a desired axis varying rate: h[0] vary first, h[1] next,..
             ZhatSpace = MDPModel.combvec_first_fast(*hz)
             XhatSpace = Uz @ ZhatSpace
 
-            #[DONE]TODO@Ruohan: compute deterministic probability matrix P_det (sparse)
+            # --- precompute once before the loop ---
+            Dinv = np.diag(1.0 / gridSize)  # inverse cell sizes in Z
+            Zl_T = Zl[:, None]  # (2,1)
+            eps = 1e-12 * float(np.max(gridSize))  # edge epsilon
+            l_tuple = tuple(l)  # for ravel_multi_index
+
+            #compute deterministic probability matrix P_det (sparse)
             nXhatSpace = XhatSpace.shape[1]
             nUhat = U_points.shape[1]
             index_total = np.arange(ZhatSpace.shape[1], dtype=int)[None, :]
             i_indices = np.empty((1, 0), dtype=int)  # 1×0 row
             j_indices = np.empty((1, 0), dtype=int)
+
             for k in range(nUhat):
                 z_n = Uz.T @ MDPModel.f_det(sys, XhatSpace, MDPModel.repmat_vector_col(U_points[:,k], n_cols=nXhatSpace) )
                 gridSize_inv = 1.0 / gridSize
@@ -723,7 +738,7 @@ class MDPModel:
             P_det = coo_matrix((data, (rows, cols)), shape=(nXhatSpace, nXhatSpace * nUhat)).tocsr()
 
 
-            #[DONE]TODO@Ruohan: compute stochastic probability matrix Pstoch
+            #compute stochastic probability matrix Pstoch
             mx2 = [((np.arange(int(li) + 1) - 0.5) * float(gs)).reshape(1, -1) for gs, li in zip(gridSize, l)]
             from scipy.stats import norm
             from scipy.linalg import toeplitz
@@ -741,13 +756,11 @@ class MDPModel:
                 P_d = toeplitz(cp)  # (L_d, L_d)
                 P.append(P_d)
 
+            # TODO@Ruohan for n>2 d
 
-            #TODO@Ruohan: feed P_det and list of Pstoch into tensor toolbox
-            #[DONE] for 2d
-            #[  ] for n>2 d
-            from .utils.TensorTransitionProbability_2D import TensorTransitionProbability_2D
+            from .utils.tensor_transition_probability_2d import TransitionProbability2D
             if mode == '2d':
-                tP_2d = TensorTransitionProbability_2D(l, P_det, P[0], P[1])
+                tP_2d = TransitionProbability2D(l, P_det, P[0], P[1])
             else:
                 raise NotImplementedError("compute_P='n>2 d' not implemented yet (tensor path).")
 
@@ -757,11 +770,6 @@ class MDPModel:
             poly_comp = qhull(p_V)
             beta = MDPModel.linear_image_vertices(poly_comp, Uz)
             return tP_2d, hz, XhatSpace, beta, sys, ZhatSpace, Uz
-
-
-
-
-
 
 
     # ======================================
