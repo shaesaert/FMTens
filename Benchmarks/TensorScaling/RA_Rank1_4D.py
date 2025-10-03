@@ -24,15 +24,29 @@ from src.dynprog.dfa_tree_r1 import DFATree
 from src.vis.dfa_tree_viz import plot_tree_layered
 
 # -----------------------
-# Continuous system (2 dimensions, each 1D)
+# Continuous system (2 dimensions, each 2D)
 # -----------------------
-A = {0: np.array([[0.9]]), 1: np.array([[0.9]])}
-B = {0: np.array([[0.5]]), 1: np.array([[0.5]])}
-C = {0: np.array([[1.0]]), 1: np.array([[1.0]])}
-D = {0: np.array([[0.0]]), 1: np.array([[0.0]])}
-Bw = {0: np.array([[0.5]]), 1: np.array([[0.5]])}
-mu = {0: np.array([0.0]), 1: np.array([0.0])}
-sigma = {0: np.eye(1), 1: np.eye(1)}
+samp_t = 0.5
+A = {0: np.array([[1.0, samp_t],
+                  [0.0, 1.0]], dtype=float),
+     1: np.array([[1.0, samp_t],
+                  [0.0, 1.0]], dtype=float)}
+B = {0: np.array([[0.0],
+              [samp_t]]),
+     1: np.array([[0.0],
+              [samp_t]])}
+C = {0: np.array([[1.0, 0.0]]),
+     1: np.array([[1.0, 0.0]])}
+D = {0: np.array([[0.0]]),
+     1: np.array([[0.0]])}
+Bw = {0: np.sqrt(0.25) * np.eye(2),
+      1: np.sqrt(0.25) * np.eye(2)}
+mu = {0: np.array([[0.0],
+              [0.0]]),
+      1: np.array([[0.0],
+              [0.0]])}
+sigma = {0: np.eye(2),
+         1: np.eye(2)}
 
 sysLTI = {
     0: LinModel(A[0], B[0], C[0], D[0], Bw[0], mu=mu[0], sigma=sigma[0]),
@@ -60,11 +74,13 @@ DFA, letters = dfa_manipulation(
 # -----------------------
 # APs and regions on original system
 # -----------------------
-s  = np.array([[1], [-1]])
-bx = np.array([5, 20])
-bu = np.array([5, 5])
+# state and input boundaries
+pl, pu = -20.0, 5.0     # position lower/upper
+vl, vu = -5.0, 5.0      # velocity lower/upper
+al, au = -2.0, 2.0
 
 # AP regions (1D)
+s  = np.array([[1], [-1]])
 bp1 = np.array([5, 0])      # p1: [0, 5]
 bp2 = np.array([0, 5])      # p2: [-5, 0]
 bp3 = np.array([-15, 20])   # p3: [-20, -15]
@@ -75,8 +91,8 @@ P3 = pc.Polytope(s, bp3)
 
 # Bind APs to systems
 for i in [0, 1]:
-    sysLTI[i].X = pc.Polytope(s, bx)
-    sysLTI[i].U = pc.Polytope(s, bu)
+    sysLTI[i].X = pc.box2poly([[pl, pu], [vl, vu]])
+    sysLTI[i].U = pc.box2poly([[al, au]])
 
 sysLTI[0].regions = [P1, P2]
 sysLTI[1].regions = [P3]
@@ -86,11 +102,13 @@ sysLTI[1].AP = ['p3']
 # -----------------------
 # Abstraction
 # -----------------------
+
 sysAbs = {
-    0: MDPModel.from_system(sysLTI[0], nx=1000, nu=5, placement='centers', u_placement='endpoints',
-                            tol=1e-19, renormalize=False, contract_sum=None, compute_P = '1d'),
-    1: MDPModel.from_system(sysLTI[1], nx=1000, nu=5, placement='centers', u_placement='endpoints',
-                            tol=1e-19, renormalize=False, contract_sum=None, compute_P = '1d'),
+    0: MDPModel.from_system(sysLTI[0], nx=[100,100], nu=10, placement='centers', u_placement='endpoints',
+                            tol=1e-19, renormalize=False, contract_sum=None, compute_P = '2d'),
+                                                        #TensorComputation = 'tensor' after implemented
+    1: MDPModel.from_system(sysLTI[1], nx=[100,100], nu=10, placement='centers', u_placement='endpoints',
+                            tol=1e-19, renormalize=False, contract_sum=None, compute_P = '2d'),
 }
 
 # -----------------------
@@ -101,14 +119,14 @@ L = dim_label(sysAbs, sysLTI, letters, visualize=True)
 # -----------------------
 # Policy (randomized uniform) & rho
 # -----------------------
+nInputs = [10,10]
 dims = sorted(sysAbs.keys())          # e.g. [0, 1, ...]
 nx   = [sysAbs[d].N for d in dims]    # states per dim
-nu   = [sysAbs[d].M for d in dims]    # actions per dim
+nu   = [nInputs[d] for d in dims]    # actions per dim
 nQ   = len(DFA.S)                     # #DFA states (0-based)
 
 # randomized policy: for every DFA state q and dimension d,
 # use a uniform distribution over actions at every state i
-
 pol = [
     [np.full((nx[d], nu[d]), 1.0/nu[d], dtype=float) for d in range(len(dims))]
     for _ in range(nQ)
@@ -128,7 +146,7 @@ G.initiate()
 plot_tree_layered(G)
 
 # 2) Grow tree
-T = 5
+T = 10
 for it in range(1, T + 1):
     print(f"\n=== Iteration {it} ===")
     G.maxpolicy(rho)
@@ -138,15 +156,3 @@ for it in range(1, T + 1):
     plot_tree_layered(G)
 
 exit = 1
-# -----------------------
-# Visualization of satProb
-# -----------------------
-
-
-
-
-
-
-
-
-

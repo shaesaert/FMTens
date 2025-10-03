@@ -73,8 +73,26 @@ class DFATree:
         return int(self.tree.nodes[n]["q"])
 
     def _nu_of_dim(self, d: int) -> int:
-        """Number of actions for dimension d inferred from flat transition shape."""
-        P_flat = np.asarray(getattr(self.sysAbs[d], "P"), dtype=float)  # (N, N*nu)
+        """
+        Number of actions for dimension d inferred from the transition container.
+
+        Supports:
+          - 1D: self.sysAbs[d].P is a dense ndarray shaped (N, N*nu)
+          - 2D/tensor: self.sysAbs[d].P is an object exposing .P_det (sparse/dense)
+        """
+        Pobj = getattr(self.sysAbs[d], "P")
+
+        # 2D/tensor wrapper: use its P_det
+        if hasattr(Pobj, "P_det"):
+            P_det = Pobj.P_det  # may be scipy.sparse or ndarray
+            # get shape without forcing dense
+            N, NU = P_det.shape
+            if NU % N != 0:
+                raise ValueError(f"P_det must be (N, N*nu); got {P_det.shape}")
+            return NU // N
+
+        # 1D dense path (unchanged)
+        P_flat = np.asarray(Pobj, dtype=float)  # (N, N*nu)
         N, NU = P_flat.shape
         if NU % N != 0:
             raise ValueError(f"P must be (N, N*nu); got {P_flat.shape}")
@@ -211,9 +229,6 @@ class DFATree:
             return
 
         for d in range(self.dim):
-            # if self.Pxx[q][d] is None:
-            #     self.Pxx[q][d] = self.Pc(self.sysAbs[d].P_flat, self.pol[q][d])
-
             v_parent = self.V[d][p, :]
             v_parent_row = v_parent.reshape(1, -1)
 
@@ -221,9 +236,24 @@ class DFATree:
             mask_row = mask.reshape(1, -1)  # (1, N)
 
             elemul = v_parent_row * mask_row
-            vx = elemul @ self.Pxx[q][d]
+
+            # naive computation, one line, works for 1d case:
+            # vx = elemul @ self.Pxx[q][d]
+
+            if self.sysAbs[0].dim == 1:
+                mat = self.Pxx[q][d]
+                vx = elemul @ mat
+            elif self.sysAbs[0].dim == 2:
+                mat = self.Pxx[q][d]
+                # EQUIVALENCE: vx = mat.mtimes(elemul)
+                vx = elemul @ mat.stoch
+
+            else:
+                raise ValueError(f"{self.sysAbs[0].dim}>2 is not supported.")
+
 
             self.V[d][n, :] = vx.ravel()
+
 
     def update_tree(self) -> None:
         """Propagate values deepest→root, skipping the root itself."""
@@ -257,24 +287,34 @@ class DFATree:
             N = self.nx[d]
 
             # Get flat transition P_flat[d] with shape (N, N*nu)
-            P_flat = np.asarray(getattr(self.sysAbs[d], "P"), dtype=float, order='F')
-            # if P_flat.shape[0] != N or (P_flat.shape[1] % N) != 0:
-            #     raise ValueError(f"P must be (N, N*nu); got {P_flat.shape} for dim {d}")
-            nu = P_flat.shape[1] // N
+            # P_flat = np.asarray(getattr(self.sysAbs[d], "P"), dtype=float, order='F')
 
-            # Row vectors (1, N): mask and parent value
-            mask_row = np.asarray(self.L[d][l, :], dtype=float).reshape(1, -1)
-            v_parent_row = np.asarray(self.V[d][nparent, :], dtype=float).reshape(1, -1)
+            P_attr = getattr(self.sysAbs[d], "P", None)
+            if self.sysAbs[0].dim == 1:
+                P_flat = P_attr
+                nu = P_flat.shape[1] // N
+                mask_row = np.asarray(self.L[d][l, :], dtype=float).reshape(1, -1)
+                v_parent_row = np.asarray(self.V[d][nparent, :], dtype=float).reshape(1, -1)
+                w = mask_row * v_parent_row
+                prod = np.asfortranarray(w) @ P_flat
+                Qv_d = np.reshape(prod, (N, nu), order='F')
+                Qv.append(Qv_d)
 
-            # Elementwise mask, then multiply by flat transitions
-            w = mask_row * v_parent_row  # (1, N)
-            prod = np.asfortranarray(w) @ P_flat  # (1, N*nu)
+            elif self.sysAbs[0].dim == 2:
+                nu = P_attr.a
+                mask_row = np.asarray(self.L[d][l, :], dtype=float).reshape(1, -1)
+                v_parent_row = np.asarray(self.V[d][nparent, :], dtype=float).reshape(1, -1)
+                w = mask_row * v_parent_row
+                # EQUIVALENCE: prod = P_attr.mtimes( np.asfortranarray(w)  )
+                prod = np.asfortranarray(w) @ P_attr.stoch
+                Qv_d = np.reshape(prod, (N, nu), order='F')
+                Qv.append(Qv_d)
 
-            # Reshape blockwise into (N, nu): split N*nu into nu blocks of length N
-            #Vxa_d = prod.reshape(nu, N).T  # (N, nu)
-            Qv_d = np.reshape(prod, (N, nu), order='F')
-            Qv.append(Qv_d)
+            else:
+                raise ValueError(f"{self.sysAbs[0].dim}>2 is not supported.")
+
         return Qv
+
 
     # ---------- policy improvement ----------
     def maxpolicy(self, rho):
@@ -305,7 +345,9 @@ class DFATree:
             # If there's no Q for this state, refresh cache with uniform policy and continue
             if not self.Q[q]:
                 for d in range(self.dim):
-                    self.Pxx[q][d] = Pc(self.sysAbs[d].P_flat, uniform_pol_dense(d))
+                    P_src = self.sysAbs[d].P_flat if self.sysAbs[d].P_flat is not None else self.sysAbs[d].P
+                    self.Pxx[q][d] = Pc(P_src, uniform_pol_dense(d))
+                    # self.Pxx[q][d] = Pc(self.sysAbs[d].P_flat, uniform_pol_dense(d))
                 continue
 
             # accumulate per-dimension scores
@@ -344,7 +386,9 @@ class DFATree:
                     (np.ones_like(rows, dtype=float), (rows, I)),
                     shape=Vxa[d].shape
                 )
-                self.Pxx[q][d] = Pc(self.sysAbs[d].P_flat,pol[q][d])
+                P_src = self.sysAbs[d].P_flat if self.sysAbs[d].P_flat is not None else self.sysAbs[d].P
+                self.Pxx[q][d] = Pc(P_src, pol[q][d])
+                #self.Pxx[q][d] = Pc(self.sysAbs[d].P_flat,pol[q][d])
 
         return self.Pxx
 
@@ -357,6 +401,58 @@ class DFATree:
             nodeIDs = self.findSubtree(n_next, nodeIDs)
         nodeIDs.append(n)
         return nodeIDs
+
+    def prune(self, tol: float, *args) -> None:
+        """
+        Prune nodes whose product over dimensions of max V along the row is < tol.
+        Usage:
+            prune(tol)            -> consider ALL nodes
+            prune(tol, 'leafs')   -> consider ONLY current leaf nodes
+        """
+        use_leafs = (len(args) >= 1) and (args[0] == 'leafs')
+
+        # rows to evaluate
+        if use_leafs:
+            rows = np.asarray(self.leafs, dtype=int)
+        else:
+            rows = np.arange(self.tree.number_of_nodes(), dtype=int)
+
+        if rows.size == 0:
+            return
+
+        # per-dimension max over columns, for the chosen rows
+        # max_vals[d] has shape (len(rows),)
+        max_vals = []
+        for d in range(self.dim):
+            Vd = np.asarray(self.V[d], dtype=float)
+            # guard if V has fewer rows (shouldn't happen, but safe)
+            nrows = min(Vd.shape[0], rows.max() + 1) if rows.size else 0
+            sel = rows[rows < nrows]
+            if sel.size == 0:
+                max_vals.append(np.zeros(rows.shape[0], dtype=float))
+                continue
+
+            md = np.zeros(rows.shape[0], dtype=float)
+            md[np.isin(rows, sel)] = np.max(Vd[sel, :], axis=1)
+            max_vals.append(md)
+
+        # product across dimensions (elementwise)
+        prod_vals = np.ones(rows.shape[0], dtype=float)
+        for md in max_vals:
+            prod_vals *= md
+
+        # nodes to prune: product < tol
+        idx = np.where(prod_vals < tol)[0]
+        if idx.size == 0:
+            return
+
+        if use_leafs:
+            nodeids = [int(self.leafs[i]) for i in idx]
+        else:
+            nodeids = [int(rows[i]) for i in idx]
+
+        print(f"Pruning nodeids = {nodeids}")
+        self.removeBranch(nodeids)
 
     def removeBranch(self, nodes: List[int]) -> None:
         """

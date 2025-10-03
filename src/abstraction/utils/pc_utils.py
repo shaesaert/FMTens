@@ -1,43 +1,58 @@
 # pc_utils.py
-from typing import Tuple
+from typing import Union
 import numpy as np
 from scipy import sparse
 
-def Pc(P_flat, pol) -> np.ndarray:
+# import your wrapper
+from src.models.utils.tensor_transition_probability_2d import TransitionProbability2D
+
+
+Matrix = Union[np.ndarray, sparse.spmatrix]
+
+def Pc(P_flat: Union[np.ndarray, TransitionProbability2D], pol: Matrix):
     """
-    Compute the compressed (controlled) transition matrix Pcomp from:
-      - P_flat: an (N, N*nu) array of transitions concatenated by action
-      - pol:    an (N, nu) policy matrix (ideally one-hot), typically CSR
+    Compose policy with a block-column transition.
 
-    This version mirrors the original in-place logic you were using:
-      1) Create a length-(N*nu) selector vector v_den from the one-hot policy.
-      2) Multiply column-wise: Plarge = P_flat * v_den.
-      3) Sum selected N-column blocks back into an (N, N) matrix.
+    If P_flat is:
+      • TransitionProbability2D with P_det (n, n*nu) and Pi[0], Pi[1]:
+          - returns a NEW TransitionProbability2D with SAME l, Pi
+            but P_det collapsed to (n, n).
+      • ndarray (n, n*nu): returns collapsed (n, n) ndarray.
 
-    Returns
-    -------
-    Pcomp : np.ndarray of shape (N, N)
+    Never mutates the input P_flat.
     """
-    Pprob = np.asarray(P_flat, float)  # (N, N*nu)
-    m, n = pol.shape                   # m = N, n = nu
+    # normalize policy -> CSR (N, nu)
+    if not sparse.issparse(pol):
+        pol = sparse.csr_matrix(pol)
+    N, nu = pol.shape
 
-    coo = pol.tocoo()
-    # k indexes which columns (within the N*nu flattened-by-block structure) are picked
-    k = coo.row + coo.col * m
-    # Build a 1 x (N*nu) sparse row vector with ones at those positions
-    v = sparse.csr_matrix((coo.data, (np.zeros_like(k), k)), shape=(1, m * n))
-    v_den = np.asarray(v.toarray()).ravel()
+    # policy vector in Fortran order: [π(:,1); π(:,2); ...]  (N*nu,)
+    v = np.asarray(pol.toarray()).ravel(order="F")
 
-    # Column-wise Hadamard (broadcasted) selection of P_flat columns
-    Plarge = Pprob * v_den  # still (N, N*nu)
+    # ---- 2D / wrapper path: build a NEW wrapper with collapsed P_det ----
+    if hasattr(P_flat, "P_det"):
+        P_full = P_flat.P_det                       # (n, n*nu) sparse or dense
+        K0, K1 = P_flat.Pi[0], P_flat.Pi[1]
+        l = (P_flat.l1, P_flat.l2)
+        n = P_flat.n
 
-    # Fold N-column blocks back into an (N, N) matrix
-    r, c = Plarge.shape
-    cr = c // r
-    Pcomp = np.zeros((r, r), dtype=Plarge.dtype)
+        if sparse.issparse(P_full):
+            Plarge = P_full @ sparse.diags(v)       # (n, n*nu) sparse
+            blocks = Plarge.shape[1] // n
+            P_comp = sparse.csr_matrix((n, n))
+            for i in range(blocks):
+                P_comp += Plarge[:, i*n:(i+1)*n]    # sum N-wide blocks -> (n, n)
+        else:
+            P_full = np.asarray(P_full, float)
+            Plarge = P_full * v                     # column scaling
+            blocks = Plarge.shape[1] // N
+            P_comp = Plarge.reshape(N, N, blocks, order="F").sum(axis=2)  # (n, n)
 
+        # return a NEW wrapper with (n,n) P_det and same Pi
+        return TransitionProbability2D(l=l, P_det=P_comp, Pi0=K0, Pi1=K1)
 
-    for i in range(cr):  # i = 0..cr-1
-        Pcomp += Plarge[:, i * r: (i + 1) * r]
-
-    return Pcomp
+    # ---- 1D dense path: return (N,N) ndarray ----
+    P_full = np.asarray(P_flat, float)              # (N, N*nu)
+    Plarge = P_full * v
+    blocks = Plarge.shape[1] // N
+    return Plarge.reshape(N, N, blocks, order="F").sum(axis=2)
