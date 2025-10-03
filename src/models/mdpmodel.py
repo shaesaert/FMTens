@@ -30,6 +30,7 @@ from typing import List, Optional, Tuple, Union
 import numpy as np
 import polytope as pc
 from scipy.special import erf as _erf
+from scipy import stats
 
 Array = np.ndarray
 
@@ -38,10 +39,6 @@ Array = np.ndarray
 # Helper math utilities
 # =====================
 
-def _normal_cdf(x: Array, m: float, s: float) -> Array:
-    """Gaussian CDF with mean m and std s; supports NumPy broadcasting."""
-    z = (x - m) / (s * np.sqrt(2.0))
-    return 0.5 * (1.0 + _erf(z))
 
 
 def _cartesian_from_axes(axes: List[Array]) -> Array:
@@ -508,7 +505,9 @@ class MDPModel:
                 pij = np.array([1.0], dtype=float)
                 for d in range(n):
                     e = edges[d]
-                    cdf_r = _normal_cdf(e[1:], m_vec[d], std[d])
+                    wdist = stats.norm(loc=m_vec[d], scale=std[d])
+                    cdf_r = wdist.cdf()
+                    #_normal_cdf(e[1:], m_vec[d], std[d])
                     cdf_l = _normal_cdf(e[:-1], m_vec[d], std[d])
                     cp = cdf_r - cdf_l
                     cp[cp < tol] = 0.0
