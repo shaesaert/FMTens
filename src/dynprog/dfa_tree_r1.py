@@ -24,7 +24,7 @@ class DFATree:
     """
 
     # ---------- construction ----------
-    def __init__(self, DFA, sysAbs, pol, nx_list, L):
+    def __init__(self, DFA, sysAbs, pol, nx_list, L, delta=None):
         self.DFA = DFA
 
         # Normalize sysAbs / nx / L to aligned lists (allow dicts keyed 0..D-1)
@@ -49,6 +49,24 @@ class DFATree:
         # pol[q][d] is (N, nu) dense or csr one-hot (or None -> uniform)
         self.pol = pol
 
+        # === [optional Delta] ===
+        if delta is None:
+            self.delta: List[np.ndarray] = [np.zeros(self.nx[d], dtype=float) for d in range(self.dim)]
+        elif isinstance(delta, (list, tuple)):
+            if len(delta) != self.dim:
+                raise ValueError(f"delta list length {len(delta)} != dim {self.dim}")
+            self.delta = []
+            for d in range(self.dim):
+                vec = np.asarray(delta[d], dtype=float).ravel()
+                if vec.size != self.nx[d]:
+                    raise ValueError(f"delta[{d}] length {vec.size} != N_d ({self.nx[d]})")
+                # clamp negatives just in case
+                self.delta.append(np.maximum(vec, 0.0))
+        else:
+            raise TypeError("delta must be None or a list/tuple of vectors (one per dimension)")
+
+        # === end of delta
+
         # Validate DFA is 0-based, consecutive
         S = list(np.asarray(DFA.S).ravel())
         if not (min(S) == 0 and max(S) == len(S) - 1 and len(set(S)) == len(S)):
@@ -66,8 +84,70 @@ class DFATree:
         self.tree: nx.DiGraph = nx.DiGraph()
         self.leafs: List[int] = []
         self.Q: Dict[int, List[int]] = {int(q): [] for q in DFA.S}  # DFA state q -> list of node ids
+        self.Dl: List[List[List[int]]] = []
 
     # ---------- helpers ----------
+    def _recompute_levels(self) -> None:
+        """
+        Build Dl as per-depth buckets, using G.Q for DFA labeling:
+          Dl[depth][0] = nodes at this depth with q == DFA.F   (qf bucket)
+          Dl[depth][1] = nodes at this depth with q != DFA.F   (q0/non-final bucket)
+        """
+        Dl = []
+        if 0 in self.tree:
+            # depth for every node
+            lengths = nx.single_source_shortest_path_length(self.tree, 0)
+            if lengths:
+                maxd = max(lengths.values())
+                Dl = [[[], []] for _ in range(maxd + 1)]
+
+                F = int(self.DFA.F)
+                # sets for fast membership
+                qf_nodes = set(self.Q.get(F, []))
+                # everything else is “q0/non-final” bucket; you may refine if you track an explicit q0
+                # collect all nodes across non-final states
+                non_final_nodes = set()
+                for q, nodes in self.Q.items():
+                    if int(q) != F:
+                        non_final_nodes.update(nodes)
+
+                # assign by depth using the sets above
+                for n, d in lengths.items():
+                    if n in qf_nodes:
+                        Dl[d][0].append(int(n))
+                    elif n in non_final_nodes:
+                        Dl[d][1].append(int(n))
+                    else:
+                        # Fallback: if a node isn’t in Q-mapping (shouldn’t happen), use its stored q
+                        q = self.Lq(n)
+                        (Dl[d][0] if q == F else Dl[d][1]).append(int(n))
+
+                # stable ordering
+                for level in Dl:
+                    level[0].sort()
+                    level[1].sort()
+
+        self.Dl = Dl
+        self.tree.graph['Dl'] = Dl
+
+    # def _recompute_levels(self) -> None:
+    #     """
+    #     Recompute Dl: Dl[k] = list of node ids at graph distance k from root (0).
+    #     Also mirrors it onto self.tree.graph['Dl'] for convenient external access.
+    #     """
+    #     Dl: List[List[int]] = []
+    #     if 0 in self.tree:
+    #         lengths = nx.single_source_shortest_path_length(self.tree, 0)
+    #         if lengths:
+    #             maxd = max(lengths.values())
+    #             Dl = [[] for _ in range(maxd + 1)]
+    #             for n, d in lengths.items():
+    #                 Dl[d].append(int(n))
+    #             for lst in Dl:
+    #                 lst.sort()
+    #     self.Dl = Dl
+    #     self.tree.graph['Dl'] = Dl
+
     def Lq(self, n: int) -> int:
         """Return DFA state (0-based) stored on node n."""
         return int(self.tree.nodes[n]["q"])
@@ -150,6 +230,8 @@ class DFATree:
         for n in self.leafs:
             self.Q[self.Lq(n)].append(n)
 
+        self._recompute_levels()
+
         return self
 
     # ---------- growth ----------
@@ -205,6 +287,9 @@ class DFATree:
         for nid in new_nodes:
             self.Q[self.Lq(nid)].append(nid)
 
+        # Update levels Dl
+        self._recompute_levels()
+
     # ---------- dynamic programming ----------
     def update_node_value(self, n: int) -> None:
         """
@@ -252,7 +337,11 @@ class DFATree:
                 raise ValueError(f"{self.sysAbs[0].dim}>2 is not supported.")
 
 
-            self.V[d][n, :] = vx.ravel()
+            # self.V[d][n, :] = vx.ravel()
+
+            self.V[d][n, :] = np.maximum(vx.ravel() - self.delta[d], 0.0)
+
+
 
 
     def update_tree(self) -> None:
@@ -357,6 +446,9 @@ class DFATree:
             # iterate over all n in Q[q]
             for n in self.Q[q]:
                 Qv = self.Q_n(n)  # list of arrays, each (N_d, nu_d)
+
+                # for d in range(self.dim):
+                #     Qv[d] = np.maximum(Qv[d] - self.delta[d][:, None], 0.0)
 
                 # constants c[d] using UNIFORM policy
                 c = np.zeros(self.dim, dtype=float)
@@ -489,6 +581,9 @@ class DFATree:
                 new = mapping[old]
                 new_V[new, :] = old_V[old, :]
             self.V[d] = new_V
+
+        # update levels Dl
+        self._recompute_levels()
 
     # ---------- plotting ----------
     def plot(self, use_letters: bool = False) -> None:

@@ -121,7 +121,7 @@ DFA, letters = dfa_manipulation(
 sysAbs: dict[int, Optional[np.ndarray]] = {i: None for i in range(dim)}
 for i in range(dim):
     sysAbs[i] = MDPModel.from_system(sysLTI[i], nx=100, nu=5, placement='centers', u_placement='endpoints',
-                            tol=1e-19, renormalize=False, contract_sum=None, compute_P = '1d')
+                            tol=1e-19, contract_sum=None, compute_P = '1d')
 
 # -----------------------
 # Labeling

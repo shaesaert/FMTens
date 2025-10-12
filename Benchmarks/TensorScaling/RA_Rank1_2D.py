@@ -14,7 +14,7 @@ reload(DFATree_mod)
 
 import numpy as np
 import polytope as pc
-from pathlib import Path; import h5py
+# from pathlib import Path; import h5py
 from src.models.linmodel import LinModel
 from src.models.mdpmodel import MDPModel
 from src.specifications.translate import translate
@@ -22,6 +22,8 @@ from src.specifications.utils.dfa_tool import dfa_manipulation
 from src.abstraction.utils.labeling import dim_label
 from src.dynprog.dfa_tree_r1 import DFATree
 from src.vis.dfa_tree_viz import plot_tree_layered
+
+
 
 # -----------------------
 # Continuous system (2 dimensions, each 1D)
@@ -86,11 +88,12 @@ sysLTI[1].AP = ['p3']
 # -----------------------
 # Abstraction
 # -----------------------
+
 sysAbs = {
     0: MDPModel.from_system(sysLTI[0], nx=1000, nu=5, placement='centers', u_placement='endpoints',
-                            tol=1e-19, renormalize=False, contract_sum=None, compute_P = '1d'),
+                            tol=1e-19, contract_sum=None, compute_P = '1d'),
     1: MDPModel.from_system(sysLTI[1], nx=1000, nu=5, placement='centers', u_placement='endpoints',
-                            tol=1e-19, renormalize=False, contract_sum=None, compute_P = '1d'),
+                            tol=1e-19, contract_sum=None, compute_P = '1d'),
 }
 
 # -----------------------
@@ -117,18 +120,25 @@ pol = [
 # sampling rho: uniform over states in each dimension
 rho = [np.full(nx[d], 1.0/nx[d], dtype=float) for d in range(len(dims))]
 
+nx_list = [sysAbs[k].N for k in sorted(sysAbs.keys())]
+L_list  = [L[k]       for k in sorted(sysAbs.keys())]
+
+# -----------------------
+# Configure delta
+# -----------------------
+from src.config.delta_ui import interactive_delta
+mode, delta_sys, delta_list_tree, apos, dims_sorted = interactive_delta(sysAbs, default=0.001)
+
 # -----------------------
 # Tree
 # -----------------------
 # 1) Initialization
-nx_list = [sysAbs[k].N for k in sorted(sysAbs.keys())]
-L_list  = [L[k]       for k in sorted(sysAbs.keys())]
-G = DFATree(DFA, sysAbs, pol, nx_list, L_list)
+G = DFATree(DFA, sysAbs, pol, nx_list, L_list, delta=delta_list_tree)
 G.initiate()
-plot_tree_layered(G)
 
 # 2) Grow tree
-T = 5
+T = 20
+
 for it in range(1, T + 1):
     print(f"\n=== Iteration {it} ===")
     G.maxpolicy(rho)
@@ -137,13 +147,23 @@ for it in range(1, T + 1):
     G.grow()
     plot_tree_layered(G)
 
+# 3) Compute lb(satProb) based on tree
+from src.dynprog.utils.treebasedV import compute_tv_from_tree
+tv = compute_tv_from_tree(G, DFA, L, max_elements=50_000_000)
+
+if apos == 1:
+    from src.dynprog.utils.v_apos import apply_delta_correction_apos
+    tv = apply_delta_correction_apos(tv, G, DFA, L, sysAbs, delta_sys=delta_sys, T=T)
+
+# -----------------------
+# visualize satProb
+# -----------------------
+from src.vis.plot_tv import plotV_rank1
+plotV_rank1(sysAbs, tv)
+import matplotlib.pyplot as plt
+plt.show()
+
 exit = 1
-# -----------------------
-# Visualization of satProb
-# -----------------------
-
-
-
 
 
 

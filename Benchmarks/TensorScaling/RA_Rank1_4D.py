@@ -105,10 +105,10 @@ sysLTI[1].AP = ['p3']
 
 sysAbs = {
     0: MDPModel.from_system(sysLTI[0], nx=[100,100], nu=10, placement='centers', u_placement='endpoints',
-                            tol=1e-19, renormalize=False, contract_sum=None, compute_P = '2d'),
+                            tol=1e-19,  contract_sum=None, compute_P = '2d'),
                                                         #TensorComputation = 'tensor' after implemented
     1: MDPModel.from_system(sysLTI[1], nx=[100,100], nu=10, placement='centers', u_placement='endpoints',
-                            tol=1e-19, renormalize=False, contract_sum=None, compute_P = '2d'),
+                            tol=1e-19, contract_sum=None, compute_P = '2d'),
 }
 
 # -----------------------

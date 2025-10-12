@@ -119,8 +119,8 @@ DFA, letters = dfa_manipulation(
 # -----------------------
 sysAbs: dict[int, Optional[np.ndarray]] = {i: None for i in range(dim)}
 for i in range(dim):
-    sysAbs[i] = MDPModel.from_system(sysLTI[i], nx=100, nu=5, placement='centers', u_placement='endpoints',
-                            tol=1e-19, renormalize=False, contract_sum=None, compute_P = '1d')
+    sysAbs[i] = MDPModel.from_system(sysLTI[i], nx=10, nu=5, placement='centers', u_placement='endpoints',
+                            tol=1e-19, contract_sum=None, compute_P = '1d')
 
 # -----------------------
 # Labeling
@@ -151,22 +151,40 @@ rho = [np.full(nx[d], 1.0/nx[d], dtype=float) for d in range(len(dims))]
 # 1) Initialization
 nx_list = [sysAbs[k].N for k in sorted(sysAbs.keys())]
 L_list  = [L[k]       for k in sorted(sysAbs.keys())]
-G = DFATree(DFA, sysAbs, pol, nx_list, L_list)
+
+
+# -----------------------
+# Configure delta
+# -----------------------
+from src.config.delta_ui import interactive_delta
+mode, delta_sys, delta_list_tree, apos, dims_sorted = interactive_delta(sysAbs, default=0.001)
+
+# -----------------------
+# Tree
+# -----------------------
+# 1) Initialization
+G = DFATree(DFA, sysAbs, pol, nx_list, L_list, delta=delta_list_tree)
 G.initiate()
-plot_tree_layered(G)
 
 # 2) Grow tree
-T = 5
+T = 20
+
 for it in range(1, T + 1):
     print(f"\n=== Iteration {it} ===")
     G.maxpolicy(rho)
     G.update_tree()
-    # G.prune(0.005,'leafs')
+    G.prune(0.005,'leafs')
     G.grow()
     plot_tree_layered(G)
 
-# Memory usage calculation
-mb = sum(np.asarray(G.V[d]).nbytes for d in range(len(G.V))) / (1024**2)
-print(f"Total G.V arrays: {mb:.2f} MB")
+# 3) Compute lb(satProb) based on tree
+from src.dynprog.utils.treebasedV import compute_tv_from_tree
+tv = compute_tv_from_tree(G, DFA, L, max_elements=50_000_000)
+
+if apos == 1:
+    from src.dynprog.utils.v_apos import apply_delta_correction_apos
+    tv = apply_delta_correction_apos(tv, G, DFA, L, sysAbs, delta_sys=delta_sys, T=T)
+
 
 exit = 1
+
