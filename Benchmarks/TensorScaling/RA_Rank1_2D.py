@@ -90,9 +90,9 @@ sysLTI[1].AP = ['p3']
 # -----------------------
 
 sysAbs = {
-    0: MDPModel.from_system(sysLTI[0], nx=1000, nu=5, placement='centers', u_placement='endpoints',
+    0: MDPModel.from_system(sysLTI[0], nx=1000, nu=10, placement='centers', u_placement='endpoints',
                             tol=1e-19, contract_sum=None, compute_P = '1d'),
-    1: MDPModel.from_system(sysLTI[1], nx=1000, nu=5, placement='centers', u_placement='endpoints',
+    1: MDPModel.from_system(sysLTI[1], nx=1000, nu=10, placement='centers', u_placement='endpoints',
                             tol=1e-19, contract_sum=None, compute_P = '1d'),
 }
 
@@ -137,7 +137,7 @@ G = DFATree(DFA, sysAbs, pol, nx_list, L_list, delta=delta_list_tree)
 G.initiate()
 
 # 2) Grow tree
-T = 20
+T = 58
 
 for it in range(1, T + 1):
     print(f"\n=== Iteration {it} ===")

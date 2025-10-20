@@ -36,7 +36,7 @@ def plotV_rank1(sysAbs, tv, ax=None):
         cmap="viridis",  # 0→blue, 1→yellow
         vmin=0.0, vmax=1.0
     )
-    plt.colorbar(im, ax=ax)
+    # plt.colorbar(im, ax=ax)
     ax.set_xlabel(r"$x_1$")
     ax.set_ylabel(r"$x_2$")
     ax.set_title("tv heatmap")

@@ -387,6 +387,7 @@ class DFATree:
                 w = mask_row * v_parent_row
                 prod = np.asfortranarray(w) @ P_flat
                 Qv_d = np.reshape(prod, (N, nu), order='F')
+                # Qv_d = np.maximum(Qv_d - 0.001, 0.0)
                 Qv.append(Qv_d)
 
             elif self.sysAbs[0].dim == 2:
@@ -447,8 +448,8 @@ class DFATree:
             for n in self.Q[q]:
                 Qv = self.Q_n(n)  # list of arrays, each (N_d, nu_d)
 
-                # for d in range(self.dim):
-                #     Qv[d] = np.maximum(Qv[d] - self.delta[d][:, None], 0.0)
+                for d in range(self.dim):
+                    Qv[d] = np.maximum(Qv[d] - self.delta[d][:, None], 0.0)
 
                 # constants c[d] using UNIFORM policy
                 c = np.zeros(self.dim, dtype=float)
@@ -480,7 +481,6 @@ class DFATree:
                 )
                 P_src = self.sysAbs[d].P_flat if self.sysAbs[d].P_flat is not None else self.sysAbs[d].P
                 self.Pxx[q][d] = Pc(P_src, pol[q][d])
-                #self.Pxx[q][d] = Pc(self.sysAbs[d].P_flat,pol[q][d])
 
         return self.Pxx
 
@@ -568,6 +568,11 @@ class DFATree:
 
         # 4) rebuild leafs and Q using new ids
         self.leafs = [mapping[leaf] for leaf in self.leafs if leaf in mapping]
+
+        # # also add parents who just lose a child as leaves to avoid drop in EC convergence
+        # self.leafs = [n for n in self.tree.nodes
+        #               if self.tree.out_degree(n) == 0 and n != 0]
+
         new_Q = {int(q): [] for q in self.DFA.S}
         for q, lst in self.Q.items():
             new_Q[q] = [mapping[n] for n in lst if n in mapping]
