@@ -1,424 +1,3 @@
-# # -----------------------------------------
-# # Evaluate average anchor values AFTER all iterations
-# # (per t_spec, average over 5 anchors: 40,45,50,55,59 across all dimensions)
-# # -----------------------------------------
-#
-# # ---------- choose a GUI backend BEFORE importing pyplot ----------
-# import platform
-# import matplotlib as mpl
-# try:
-#     mpl.use("QtAgg", force=True)          # prefer Qt for interactive
-# except Exception:
-#     if platform.system() == "Darwin":
-#         mpl.use("MacOSX", force=True)     # macOS native
-#     else:
-#         mpl.use("TkAgg", force=True)      # fallback
-#
-# import matplotlib.pyplot as plt
-# print("Matplotlib backend:", mpl.get_backend())
-#
-# # ---- TeX styling (comment these two if no LaTeX installed) ----
-# mpl.rcParams['text.usetex'] = True
-# mpl.rcParams['text.latex.preamble'] = r'\usepackage{amsmath}\usepackage{bm}'
-#
-# mpl.rcParams.update({
-#     "font.family": "DejaVu Sans",
-#     "mathtext.fontset": "dejavusans",
-#     "font.size": 16,
-#     "axes.titlesize": 18,
-#     "axes.labelsize": 18,
-#     "xtick.labelsize": 14,
-#     "ytick.labelsize": 14,
-#     "legend.fontsize": 14,
-#     "font.weight": "bold",
-#     "axes.titleweight": "bold",
-#     "axes.labelweight": "bold",
-# })
-#
-# # ---- std + project imports ----
-# from importlib import reload
-# import numpy as np
-# import polytope as pc
-# from typing import Optional
-# from itertools import product
-# import matplotlib.ticker as mticker
-#
-# # Optional hot-reloads (comment out if not needed)
-# import src.models.linmodel as LinModel_mod
-# reload(LinModel_mod)
-# import src.models.mdpmodel as mdpmodel_mod
-# reload(mdpmodel_mod)
-# import src.abstraction.utils.labeling as dim_label_mod
-# reload(dim_label_mod)
-# import src.dynprog.dfa_tree_r1 as DFATree_mod
-# reload(DFATree_mod)
-#
-# from src.models.linmodel import LinModel
-# from src.models.mdpmodel import MDPModel
-# from src.specifications.translate import translate
-# from src.specifications.utils.dfa_tool import dfa_manipulation
-# from src.abstraction.utils.labeling import dim_label_eps
-# from src.dynprog.dfa_tree_r1 import DFATree
-#
-# # -----------------------
-# # Small helpers
-# # -----------------------
-# def nodes_with_q(G: DFATree, q: int):
-#     """Tree node ids whose DFA mode == q (via G.Q)."""
-#     return list(G.Q.get(int(q), []))
-#
-# def nodes_with_q_and_predcount(G: DFATree, q: int, ns: int):
-#     """
-#     Nodes in DFA mode q that have exactly ns DFA-predecessors.
-#     We use out-degree as that count.
-#     """
-#     q = int(q)
-#     return [n for n in G.Q.get(q, []) if G.tree.out_degree(n) == ns]
-#
-# def robust_value_at_anchor_mul_then_sum(G: DFATree, qbar_vec, idx_vec):
-#     """
-#     Anchor value at idx_vec:
-#       sum_{(n_0,...,n_{D-1})}  prod_d V^{(d)}[n_d, idx_vec[d]],
-#     where n_d ranges over nodes_with_q(G, qbar_vec[d]).
-#     """
-#     D = G.dim
-#     assert len(qbar_vec) == D and len(idx_vec) == D
-#
-#     per_dim = [nodes_with_q(G, int(qbar_vec[d])) for d in range(D)]
-#     if any(len(lst) == 0 for lst in per_dim):
-#         return 0.0
-#
-#     total = 0.0
-#     for combo in product(*per_dim):
-#         term = 1.0
-#         for d, n in enumerate(combo):
-#             term *= float(G.V[d][n, idx_vec[d]])
-#             if term == 0.0:
-#                 break
-#         total += term
-#     return float(total)
-#
-# def fht_term(G: DFATree, T: int, qbar_vec, idx_vec):
-#     """
-#     A-posteriori first-hitting-time term at idx_vec, evaluated after T iterations:
-#
-#       sum_{ns=1}^{T-1} (T-ns) *
-#         [ sum_{(n_0,...,n_{D-1})} prod_d V[d][n_d, idx_vec[d]] ],
-#
-#     where n_d ranges over nodes_with_q_and_predcount(G, qbar_vec[d], ns).
-#     """
-#     D = len(G.V)
-#     total = 0.0
-#     for ns in range(1, T):
-#         weight = (T - ns)
-#
-#         node_sets = []
-#         for d in range(D):
-#             nds = nodes_with_q_and_predcount(G, int(qbar_vec[d]), ns)
-#             if not nds:
-#                 node_sets = []
-#                 break
-#             node_sets.append(nds)
-#         if not node_sets:
-#             continue
-#
-#         s_ns = 0.0
-#         for combo in product(*node_sets):
-#             prod_val = 1.0
-#             for d, n_d in enumerate(combo):
-#                 prod_val *= float(G.V[d][n_d, idx_vec[d]])
-#                 if prod_val == 0.0:
-#                     break
-#             s_ns += prod_val
-#
-#         total += weight * s_ns
-#
-#     return float(total)
-#
-# # -----------------------
-# # Base system (shared across runs)
-# # -----------------------
-# dim = 20              # choose from {3,4,5,6,7,8,9,10}
-# nx_per_dim = 100         # set to 1000 for your large run
-# nu_per_dim = 10
-# bx = np.array([10, 10])  # X = [-10, 10]
-# bu = np.array([2,  2])   # U = [-2,  2]
-#
-# # One safe AP per dimension: p1_i := [-5, 5]
-# s = np.array([[1], [-1]])
-# bp1 = np.array([5, 5])
-# P1 = pc.Polytope(s, bp1)
-#
-# # LTI params (identical per dim)
-# A = {i: np.array([[0.9]]) for i in range(dim)}
-# B = {i: np.array([[0.5]]) for i in range(dim)}
-# C = {i: np.array([[1.0]]) for i in range(dim)}
-# Dmat = {i: np.array([[0.0]]) for i in range(dim)}
-# Bw = {i: np.array([[0.5]]) for i in range(dim)}
-# mu = {i: np.array([[0.0]]) for i in range(dim)}
-# sigma = {i: np.array([[1.0]]) for i in range(dim)}
-#
-# # Build continuous systems
-# sysLTI: dict[int, Optional[np.ndarray]] = {}
-# AP = set()
-# act = {}
-# safeset = ' '
-# for i in range(dim):
-#     sys = LinModel(A[i], B[i], C[i], Dmat[i], Bw[i], mu=mu[i], sigma=sigma[i])
-#     sys.X = pc.Polytope(s, bx)
-#     sys.U = pc.Polytope(s, bu)
-#     sys.AP = [f'p1{i}']
-#     sys.regions = [P1]
-#     sysLTI[i] = sys
-#
-#     act[i] = [' ', f'p1{i}']
-#     safeset += f' & p1{i}'
-#     AP.update(sys.AP)
-#
-# safeset = safeset[3:]
-# print(f"Safeset: {safeset}")
-#
-# # Uniform policy/rho templates (rebuilt per run after we know DFA size)
-# def make_uniform_pol_and_rho(DFA, sysAbs, L):
-#     dims = sorted(sysAbs.keys())
-#     nx_list = [sysAbs[d].N for d in dims]
-#     nu_list = [sysAbs[d].M for d in dims]
-#     nQ = len(DFA.S)
-#     pol = [
-#         [np.full((nx_list[d], nu_list[d]), 1.0 / nu_list[d], dtype=float) for d in range(len(dims))]
-#         for _ in range(nQ)
-#     ]
-#     rho = [np.full(nx_list[d], 1.0 / nx_list[d], dtype=float) for d in range(len(dims))]
-#     L_list = [L[d] for d in dims]
-#     return pol, rho, nx_list, L_list
-#
-# # Deltas
-# delta_i = 0.0717
-# Delta = 1.0 - (1.0 - delta_i) ** dim
-#
-# # ---- Anchor centers to sample (same index across all dims) ----
-# anchor_centers = [40, 45, 50, 55, 59]  # 5 anchors
-# anchor_idx_list = [[k]*dim for k in anchor_centers]
-#
-# # -----------------------
-# # Sweep t_spec = 4..20
-# # -----------------------
-# t_specs = list(range(4, 20))
-# rt_av_vals   = []  # average over anchors
-# apos_av_vals = []  # average over anchors
-#
-# # also keep per-anchor values for debugging/saving
-# rt_per_anchor   = []  # list of arrays (len=5) per t_spec
-# apos_per_anchor = []
-#
-# for t_spec in t_specs:
-#     print("\n" + "="*70)
-#     print(f"Building for t_spec = {t_spec}")
-#     print("="*70)
-#
-#     # -----------------------
-#     # Spec and DFA for this t_spec
-#     # -----------------------
-#     formula = ' '
-#     for t_index in range(1, t_spec - 1):
-#         X_prefix = 'X' * (t_index - 1)
-#         formula += f' & {X_prefix}({safeset})'
-#     formula = formula[3:]
-#     print(f"LTL Formula: {formula}")
-#
-#     DFA = translate(formula)
-#     DFA, letters = dfa_manipulation(
-#         DFA,
-#         index_base=0,
-#         ensure_transitions=True,
-#         remove_qf_self_loop=True,
-#         verbose=False
-#     )
-#
-#     # -----------------------
-#     # Abstraction (reuse parameters)
-#     # -----------------------
-#     sysAbs = {
-#         i: MDPModel.from_system(sysLTI[i], nx=nx_per_dim, nu=nu_per_dim,
-#                                 placement='centers', u_placement='endpoints',
-#                                 tol=1e-19, contract_sum=None, compute_P='1d')
-#         for i in range(dim)
-#     }
-#
-#     # Robust labeling (depends on DFA letters)
-#     eps_val = 0.1
-#     L = dim_label_eps(sysAbs, sysLTI, letters, eps=eps_val, visualize=False, outdir=None, prefix="L_eps")
-#
-#     # Uniform policy/rho for this DFA/abstraction
-#     pol, rho, nx_list, L_list = make_uniform_pol_and_rho(DFA, sysAbs, L)
-#
-#     # bounds sanity for anchors
-#     for d in range(dim):
-#         for idx_set in anchor_idx_list:
-#             if idx_set[d] >= nx_list[d]:
-#                 raise ValueError(f"anchor idx {idx_set[d]} out of range for dim {d} (nx={nx_list[d]}).")
-#
-#     # Initial DFA state from S0
-#     q0 = int(np.asarray(DFA.S0).ravel()[0])
-#     Trans = np.asarray(DFA.trans, dtype=int)
-#
-#     # -----------------------
-#     # Build trees for this t_spec (no pruning). Keep it simple.
-#     # Depth chosen relative to t_spec:
-#     # -----------------------
-#     T_build = max(1, t_spec - 3)
-#
-#     # RT deltas: Δ_VI = 0.0717, Δ_pol = 0.0717
-#     delta_VI_vecs_rt  = [np.full(sysAbs[d].N, delta_i, dtype=float) for d in range(dim)]
-#     delta_pol_vecs_rt = [np.full(sysAbs[d].N, delta_i, dtype=float) for d in range(dim)]
-#
-#     # APoS deltas: Δ_VI = 0.0, Δ_pol = 0.0717
-#     delta_VI_vecs_apos  = [np.zeros(sysAbs[d].N, dtype=float) for d in range(dim)]
-#     delta_pol_vecs_apos = [np.full(sysAbs[d].N, delta_i, dtype=float) for d in range(dim)]
-#
-#     # ---- RT ----
-#     G_rt = DFATree(
-#         DFA, sysAbs, pol, nx_list, L_list,
-#         delta_VI=delta_VI_vecs_rt, delta_pol=delta_pol_vecs_rt,
-#         pol_mode='rt', VI_mode='rt'
-#     ).initiate()
-#     for it in range(1, T_build + 1):
-#         G_rt.maxpolicy(rho)
-#         G_rt.update_tree()
-#         G_rt.grow()
-#
-#     # ---- APoS ----
-#     G_apos = DFATree(
-#         DFA, sysAbs, pol, nx_list, L_list,
-#         delta_VI=delta_VI_vecs_apos, delta_pol=delta_pol_vecs_apos,
-#         pol_mode='apos', VI_mode='apos'
-#     ).initiate()
-#     for it in range(1, T_build + 1):
-#         G_apos.maxpolicy(rho)
-#         G_apos.update_tree()
-#         G_apos.grow()
-#
-#     # -----------------------
-#     # Evaluate per-anchor, then average
-#     # -----------------------
-#     vals_rt   = []
-#     vals_apos = []
-#     for idx_vec in anchor_idx_list:
-#         # derive qbar for this anchor (letter active at each dim's index)
-#         qbar = []
-#         valid = True
-#         for d in range(dim):
-#             col = np.asarray(L_list[d][:, idx_vec[d]], dtype=bool)
-#             if not np.any(col):
-#                 print(f"[t_spec={t_spec}] WARNING: no active letter at idx={idx_vec[d]} for dim {d}; skipping this anchor.")
-#                 valid = False
-#                 break
-#             l = int(np.where(col)[0][0])
-#             qbar.append(int(Trans[q0, l]))
-#         if not valid:
-#             continue
-#
-#         # RT value at this anchor
-#         V_rt_k = robust_value_at_anchor_mul_then_sum(G_rt, qbar, idx_vec)
-#         vals_rt.append(V_rt_k)
-#
-#         # APoS corrected value at this anchor
-#         V_apos_base_k = robust_value_at_anchor_mul_then_sum(G_apos, qbar, idx_vec)
-#         TermFHT_k     = fht_term(G_apos, T_build, qbar, idx_vec)
-#         expr_k        = V_apos_base_k - T_build * Delta + Delta * TermFHT_k
-#         V_apos_k      = max(0.0, expr_k)  # floor at 0
-#         vals_apos.append(V_apos_k)
-#
-#         print(f"[t_spec={t_spec}] idx={idx_vec[0]}  RT={V_rt_k:.6e}  APoS={V_apos_k:.6e}")
-#
-#     # average across anchors (if any valid)
-#     if len(vals_rt) == 0:
-#         rt_av = np.nan
-#         apos_av = np.nan
-#         print(f"[t_spec={t_spec}] No valid anchors; averages are NaN.")
-#     else:
-#         rt_av = float(np.mean(vals_rt))
-#         apos_av = float(np.mean(vals_apos))
-#         print(f"[t_spec={t_spec}] AVG over anchors: RT_AV={rt_av:.6e}  APoS_AV={apos_av:.6e}")
-#
-#     rt_av_vals.append(rt_av)
-#     apos_av_vals.append(apos_av)
-#     rt_per_anchor.append(np.array(vals_rt, dtype=float))
-#     apos_per_anchor.append(np.array(vals_apos, dtype=float))
-#
-# # -----------------------
-# # Save and plot (interactive window; blocking show)
-# # -----------------------
-# rt_av_vals   = np.asarray(rt_av_vals, float)
-# apos_av_vals = np.asarray(apos_av_vals, float)
-#
-# # pack per-anchor into uniform shape (pad with NaN if some anchors skipped)
-# max_k = len(anchor_centers)
-# rt_mat = np.full((len(t_specs), max_k), np.nan, dtype=float)
-# ap_mat = np.full((len(t_specs), max_k), np.nan, dtype=float)
-# for i, (rrow, arow) in enumerate(zip(rt_per_anchor, apos_per_anchor)):
-#     k = min(max_k, len(rrow))
-#     if k > 0:
-#         rt_mat[i, :k] = rrow[:k]
-#         ap_mat[i, :k] = arow[:k]
-#
-# np.savez(
-#     "anchor_values_vs_tspec_multi_anchors.npz",
-#     t_specs=np.asarray(t_specs),
-#     anchor_centers=np.asarray(anchor_centers, dtype=int),
-#     V_rt_avg=rt_av_vals,
-#     V_apos_avg=apos_av_vals,
-#     V_rt_per_anchor=rt_mat,
-#     V_apos_per_anchor=ap_mat
-# )
-# print("Saved data to anchor_values_vs_tspec_multi_anchors.npz")
-#
-# fig, ax = plt.subplots(figsize=(12, 3))
-#
-# lbl_rt   = r'$\textbf{Optimal Robust-tree Value functions}$'
-# lbl_apos = r'$\textbf{Optimal A-posteriori corrected Value functions}$'
-#
-# ax.plot(t_specs, rt_av_vals,   marker='s', linewidth=2.0, label=lbl_rt)
-# ax.plot(t_specs, apos_av_vals, marker='o', linewidth=2.0, label=lbl_apos)
-#
-# # Legend: bottom-right, inside axes
-# leg = ax.legend(
-#     prop={'size': 18, 'weight': 'bold'},
-#     loc='upper right',
-#     bbox_to_anchor=(0.98, 0.98),
-#     bbox_transform=ax.transAxes,
-#     ncol=1,
-#     frameon=True, framealpha=0.9,
-#     borderpad=0.3, labelspacing=0.25,
-#     handlelength=2.0, handletextpad=0.5, markerscale=0.9
-# )
-#
-# # Bold tick labels
-# ax.xaxis.set_major_formatter(mticker.StrMethodFormatter(r'\textbf{{{x:g}}}'))
-# ax.yaxis.set_major_formatter(mticker.StrMethodFormatter(r'\textbf{{{x:g}}}'))
-# ax.tick_params(axis="both", labelsize=20, length=8, width=2, pad=8)
-# ax.minorticks_off()
-# ax.tick_params(axis="both", which="minor", length=5, width=1.6)
-# ax.margins(x=0.08)
-#
-# ax.set_xlabel(r'\textbf{Specification Horizon}')
-# # ax.set_ylabel(r'\textbf{Value at anchor (avg)}')
-# for s in ax.spines.values():
-#     s.set_linewidth(2)
-# ax.grid(False)
-# fig.tight_layout()
-#
-# fig.savefig("anchor_values_vs_tspec_multi_anchors.png", dpi=300, bbox_inches="tight")
-# plt.show(block=True)   # keep interactive window open
-
-
-# -----------------------------------------
-# Average anchor values AFTER all iterations
-# Four curves on one interactive plot:
-#   - RT avg (dim=4),  APoS avg (dim=4)
-#   - RT avg (dim=20), APoS avg (dim=20)
-# -----------------------------------------
-
 # ---------- choose a GUI backend BEFORE importing pyplot ----------
 import platform
 import matplotlib as mpl
@@ -483,14 +62,6 @@ def nodes_with_q(G: DFATree, q: int):
     """Tree node ids whose DFA mode == q (via G.Q)."""
     return list(G.Q.get(int(q), []))
 
-def nodes_with_q_and_predcount(G: DFATree, q: int, ns: int):
-    """
-    Nodes in DFA mode q that have exactly ns DFA-predecessors.
-    We use out-degree as that count.
-    """
-    q = int(q)
-    return [n for n in G.Q.get(q, []) if G.tree.out_degree(n) == ns]
-
 def robust_value_at_anchor_mul_then_sum(G: DFATree, qbar_vec, idx_vec):
     """
     Anchor value at idx_vec:
@@ -514,42 +85,61 @@ def robust_value_at_anchor_mul_then_sum(G: DFATree, qbar_vec, idx_vec):
         total += term
     return float(total)
 
-def fht_term(G: DFATree, T: int, qbar_vec, idx_vec):
+def fht_term(G: DFATree, T: int, qbar_vec, idx_vec) -> float:
     """
-    A-posteriori first-hitting-time term at idx_vec, evaluated after T iterations:
+    Triple sum as exat: no algebraic shortcut
 
-      sum_{ns=1}^{T-1} (T-ns) *
-        [ sum_{(n_0,...,n_{D-1})} prod_d V[d][n_d, idx_vec[d]] ],
+      for h = 0 .. T_build (= T)
+        for npred = 0 .. h-1
+          sum over nodes z that:
+             - are at depth == npred  (accessed via Dl[npred][1])
+             - are labeled qbar       (z in G.Q[qbar])
+          of  Π_d G.V[d][z, idx_x]
 
-    where n_d ranges over nodes_with_q_and_predcount(G, qbar_vec[d], ns).
+    Notes:
+      - qbar_vec and idx_vec are assumed to have identical entries (use qbar, idx_x).
     """
+    # unify qbar and idx_x
+    qbar = int(qbar_vec[0] if hasattr(qbar_vec, "__len__") else qbar_vec)
+    idx_x = int(idx_vec[0]  if hasattr(idx_vec, "__len__")  else idx_vec)
+
+    # ensure Dl is present
+    if 'Dl' not in G.tree.graph:
+        G._recompute_levels()
+    Dl = G.tree.graph['Dl']
+
+    # interested set: nodes with DFA label qbar
+    interested = set(G.Q.get(qbar, []))
+    if not interested or T <= 0:
+        return 0.0
+
     D = len(G.V)
-    total = 0.0
-    for ns in range(1, T):
-        weight = (T - ns)
 
-        node_sets = []
+    def node_val(z: int) -> float:
+        prod = 1.0
         for d in range(D):
-            nds = nodes_with_q_and_predcount(G, int(qbar_vec[d]), ns)
-            if not nds:
-                node_sets = []
-                break
-            node_sets.append(nds)
-        if not node_sets:
-            continue
+            v = float(G.V[d][z, idx_x])
+            if v <= 0.0:
+                return 0.0
+            prod *= v
+        return prod
 
-        s_ns = 0.0
-        for combo in product(*node_sets):
-            prod_val = 1.0
-            for d, n_d in enumerate(combo):
-                prod_val *= float(G.V[d][n_d, idx_vec[d]])
-                if prod_val == 0.0:
-                    break
-            s_ns += prod_val
+    total = 0.0
+    T_build = int(T)
 
-        total += weight * s_ns
+    # ---- exact three-layer loops ----
+    for h in range(0, T_build + 1):          # outer: h = 0 .. T_build
+        for npred in range(0, h):            # second: npred = 0 .. h-1
+            # nodes at this predecessor count (depth), non-final bucket as requested
+            nodes_at_npred = Dl[npred][1] if npred < len(Dl) else []
+            # restrict to nodes labeled qbar
+            nodes = [z for z in nodes_at_npred if z in interested]
+            # inner: sum products over dims
+            for z in nodes:
+                total += node_val(z)
 
     return float(total)
+
 
 def make_uniform_pol_and_rho(DFA, sysAbs, L):
     dims = sorted(sysAbs.keys())
@@ -573,7 +163,7 @@ def sweep_for_dim(DIM: int,
                   anchor_centers = (40, 45, 50, 55, 59),
                   t_specs = None):
     if t_specs is None:
-        t_specs = list(range(4, 21))   # inclusive 4..20
+        t_specs = list(range(1, 8))   # inclusive 4..20
 
     # Deltas depend on DIM
     delta_i = 0.0717
@@ -618,18 +208,31 @@ def sweep_for_dim(DIM: int,
     rt_per_anchor   = []
     apos_per_anchor = []
 
-    for t_spec in t_specs:
-        print("\n" + "="*70)
-        print(f"[D={DIM}] Building for t_spec = {t_spec}")
-        print("="*70)
+    # Collect FHT averages and the T_build sequence for plotting
+    fht_avg_vals = []
+    tbuild_vals  = []
 
-        # Spec/DFA for this t_spec   (formula: & X^k(safeset))
-        formula = ' '
-        for t_index in range(1, t_spec - 1):
-            X_prefix = 'X' * (t_index - 1)
-            formula += f' & {X_prefix}({safeset})'
-        formula = formula[3:]
-        print(f"[D={DIM}] LTL Formula: {formula}")
+    # for t_spec in t_specs:
+    #     print("\n" + "="*70)
+    #     print(f"[D={DIM}] Building for t_spec = {t_spec}")
+    #     print("="*70)
+    #
+    #     terms = [f"{'X' * k}({safeset})" for k in range(t_spec)]
+    #     formula = " & ".join(terms)
+    for t_spec in t_specs:
+        print("\n" + "=" * 70)
+        print(f"[D={DIM}] Building for t_spec = {t_spec}")
+        print("=" * 70)
+
+        ks = {0, t_spec}
+        if t_spec >= 2:
+            ks.add(t_spec - 1)
+
+        terms = [f"{'X' * k}({safeset})" for k in sorted(ks)]
+        formula = " & ".join(terms)
+
+        print(f"[D={DIM}] LTL Formula (t_spec={t_spec}): {formula}")
+
 
         DFA = translate(formula)
         DFA, letters = dfa_manipulation(
@@ -666,7 +269,8 @@ def sweep_for_dim(DIM: int,
         Trans = np.asarray(DFA.trans, dtype=int)
 
         # Build trees (simple: no prune)
-        T_build = max(1, t_spec - 3)
+        # T_build = max(1, t_spec - 3)
+        T_build = t_spec
 
         # RT deltas
         delta_VI_vecs_rt  = [np.full(sysAbs[d].N, delta_i, dtype=float) for d in range(DIM)]
@@ -693,6 +297,12 @@ def sweep_for_dim(DIM: int,
             pol_mode='apos', VI_mode='apos'
         ).initiate()
         for it in range(1, T_build + 1):
+            # if your DFATree has set_iter (for zeta scaling), call safely:
+            if hasattr(G_apos, "set_iter"):
+                try:
+                    G_apos.set_iter(it)
+                except Exception:
+                    pass
             G_apos.set_iter(it)
             G_apos.maxpolicy(rho)
             G_apos.update_tree()
@@ -701,6 +311,8 @@ def sweep_for_dim(DIM: int,
         # ---- Evaluate per-anchor, then average ----
         vals_rt   = []
         vals_apos = []
+        term_fhts = []
+
         for idx_vec in anchor_idx_list:
             # derive qbar for this anchor (letter active at each dim's index)
             qbar = []
@@ -723,8 +335,9 @@ def sweep_for_dim(DIM: int,
             # APoS corrected value
             V_apos_base_k = robust_value_at_anchor_mul_then_sum(G_apos, qbar, idx_vec)
             TermFHT_k     = fht_term(G_apos, T_build, qbar, idx_vec)
-            expr_k        = V_apos_base_k - T_build * Delta + Delta * TermFHT_k
-            V_apos_k      = max(0.0, expr_k)  # floor at 0
+            term_fhts.append(TermFHT_k)
+            expr_k        = V_apos_base_k - T_build * (1.0 - (1.0 - delta_i)**DIM) + (1.0 - (1.0 - delta_i)**DIM) * TermFHT_k
+            V_apos_k      = max(0.0, expr_k)
             vals_apos.append(V_apos_k)
 
             print(f"[D={DIM} t_spec={t_spec}] idx={idx_vec[0]}  RT={V_rt_k:.6e}  APoS={V_apos_k:.6e}")
@@ -732,28 +345,24 @@ def sweep_for_dim(DIM: int,
         if len(vals_rt) == 0:
             rt_av = np.nan
             apos_av = np.nan
+            fht_av = np.nan
             print(f"[D={DIM} t_spec={t_spec}] No valid anchors; averages are NaN.")
         else:
             rt_av = float(np.mean(vals_rt))
             apos_av = float(np.mean(vals_apos))
+            fht_av = float(np.mean(term_fhts))
             print(f"[D={DIM} t_spec={t_spec}] AVG over anchors: RT_AV={rt_av:.6e}  APoS_AV={apos_av:.6e}")
 
         rt_av_vals.append(rt_av)
         apos_av_vals.append(apos_av)
-        rt_per_anchor.append(np.array(vals_rt, dtype=float))
-        apos_per_anchor.append(np.array(vals_apos, dtype=float))
+        fht_avg_vals.append(fht_av)
+        tbuild_vals.append(T_build)
 
     # pack results
     rt_av_vals   = np.asarray(rt_av_vals, float)
     apos_av_vals = np.asarray(apos_av_vals, float)
-    max_k = len(anchor_centers)
-    rt_mat = np.full((len(t_specs), max_k), np.nan, dtype=float)
-    ap_mat = np.full((len(t_specs), max_k), np.nan, dtype=float)
-    for i, (rrow, arow) in enumerate(zip(rt_per_anchor, apos_per_anchor)):
-        k = min(max_k, len(rrow))
-        if k > 0:
-            rt_mat[i, :k] = rrow[:k]
-            ap_mat[i, :k] = arow[:k]
+    fht_avg_vals = np.asarray(fht_avg_vals, float)
+    tbuild_vals  = np.asarray(tbuild_vals, int)
 
     # save per-dimension result
     np.savez(
@@ -762,28 +371,28 @@ def sweep_for_dim(DIM: int,
         anchor_centers=np.asarray(anchor_centers, dtype=int),
         V_rt_avg=rt_av_vals,
         V_apos_avg=apos_av_vals,
-        V_rt_per_anchor=rt_mat,
-        V_apos_per_anchor=ap_mat
+        FHT_avg=fht_avg_vals,
+        T_builds=tbuild_vals
     )
     print(f"[D={DIM}] Saved data to anchor_values_vs_tspec_multi_anchors_D{DIM}.npz")
 
     return dict(
         DIM=DIM, t_specs=np.asarray(t_specs),
-        V_rt_avg=rt_av_vals, V_apos_avg=apos_av_vals
+        V_rt_avg=rt_av_vals, V_apos_avg=apos_av_vals,
+        FHT_avg=fht_avg_vals, T_builds=tbuild_vals
     )
 
 # -----------------------
-# Run for D=4 and D=20, then plot four curves
+# Run for D=4 and D=20
 # -----------------------
-t_specs = list(range(4, 21))  # inclusive 4..20
+t_specs = list(range(1, 8))  # inclusive 4..20
 anchor_centers = (40, 45, 50, 55, 59)
-
 
 res4  = sweep_for_dim(4,  nx_per_dim=100, nu_per_dim=10, anchor_centers=anchor_centers, t_specs=t_specs)
 res20 = sweep_for_dim(20, nx_per_dim=100, nu_per_dim=10, anchor_centers=anchor_centers, t_specs=t_specs)
 
 # -----------------------
-# Save combined & plot (interactive window; blocking show)
+# Save combined
 # -----------------------
 np.savez(
     "anchor_values_vs_tspec_multi_anchors_D4_D20.npz",
@@ -792,46 +401,79 @@ np.savez(
     V_rt_avg_D4=res4["V_rt_avg"],
     V_apos_avg_D4=res4["V_apos_avg"],
     V_rt_avg_D20=res20["V_rt_avg"],
-    V_apos_avg_D20=res20["V_apos_avg"]
+    V_apos_avg_D20=res20["V_apos_avg"],
+    FHT_avg_D4=res4["FHT_avg"],
+    FHT_avg_D20=res20["FHT_avg"],
+    T_builds=res4["T_builds"]        # same schedule for both Ds
 )
 print("Saved combined data to anchor_values_vs_tspec_multi_anchors_D4_D20.npz")
 
+# -----------------------
+# Plot 1: Four curves (same as before)
+# -----------------------
 plt.ion()
-fig, ax = plt.subplots(figsize=(12, 3))
+fig1, ax1 = plt.subplots(figsize=(12, 3))
 
-# Four curves: styles kept distinct
-ax.plot(res4["t_specs"],  res4["V_rt_avg"],   marker='s', linewidth=2.0, label=r'$\textbf{Optimal RT Value functions} (N=4) $')
-ax.plot(res4["t_specs"],  res4["V_apos_avg"], marker='o', linewidth=2.0, linestyle='--', label=r'$\textbf{Optimal APoS Value functions} (N=4) $')
-ax.plot(res20["t_specs"], res20["V_rt_avg"],  marker='^', linewidth=2.0, label=r'$\textbf{Optimal RT Value functions} (N=20) $')
-ax.plot(res20["t_specs"], res20["V_apos_avg"],marker='v', linewidth=2.0, linestyle='--', label=r'$\textbf{Optimal APoS Value functions} (N=20) $')
+ax1.plot(res4["t_specs"],  res4["V_rt_avg"],    marker='s', linewidth=2.0, label=r'$\textbf{Optimal RT Value functions} (N=4)$')
+ax1.plot(res4["t_specs"],  res4["V_apos_avg"],  marker='o', linewidth=2.0, linestyle='--', label=r'$\textbf{Optimal APoS Value functions} (N=4)$')
+ax1.plot(res20["t_specs"], res20["V_rt_avg"],   marker='^', linewidth=2.0, label=r'$\textbf{Optimal RT Value functions} (N=20)$')
+ax1.plot(res20["t_specs"], res20["V_apos_avg"], marker='v', linewidth=2.0, linestyle='--', label=r'$\textbf{Optimal APoS Value functions} (N=20)$')
 
-# Legend: upper-right inside axes
-leg = ax.legend(
+leg1 = ax1.legend(
     prop={'size': 16, 'weight': 'bold'},
-    loc='upper right',
-    bbox_to_anchor=(0.98, 0.98),
-    bbox_transform=ax.transAxes,
-    ncol=1,
-    frameon=True, framealpha=0.9,
+    loc='upper right', bbox_to_anchor=(0.98, 0.98),
+    bbox_transform=ax1.transAxes,
+    ncol=1, frameon=True, framealpha=0.9,
     borderpad=0.3, labelspacing=0.25,
     handlelength=2.0, handletextpad=0.5, markerscale=0.9
 )
 
-# Bold tick labels
-ax.xaxis.set_major_formatter(mticker.StrMethodFormatter(r'\textbf{{{x:g}}}'))
-ax.yaxis.set_major_formatter(mticker.StrMethodFormatter(r'\textbf{{{x:g}}}'))
-ax.xaxis.set_major_locator(mticker.MaxNLocator(integer=True))
-ax.tick_params(axis="both", labelsize=18, length=8, width=2, pad=8)
-ax.minorticks_off()
-ax.tick_params(axis="both", which="minor", length=5, width=1.6)
-ax.margins(x=0.08)
-
-ax.set_xlabel(r'\textbf{Specification Horizon}')
-# ax.set_ylabel(r'\textbf{Average Value at Anchors}')
-for s in ax.spines.values():
+ax1.xaxis.set_major_formatter(mticker.StrMethodFormatter(r'\textbf{{{x:g}}}'))
+ax1.yaxis.set_major_formatter(mticker.StrMethodFormatter(r'\textbf{{{x:g}}}'))
+ax1.xaxis.set_major_locator(mticker.MaxNLocator(integer=True))
+ax1.tick_params(axis="both", labelsize=18, length=8, width=2, pad=8)
+ax1.minorticks_off()
+ax1.tick_params(axis="both", which="minor", length=5, width=1.6)
+ax1.margins(x=0.08)
+ax1.set_xlabel(r'\textbf{Specification Horizon}')
+for s in ax1.spines.values():
     s.set_linewidth(2)
-ax.grid(False)
-fig.tight_layout()
+ax1.grid(False)
 
-fig.savefig("anchor_values_vs_tspec_multi_anchors_D4_D20.png", dpi=300, bbox_inches="tight")
-plt.show(block=True)   # keep interactive window open
+fig1.tight_layout()
+fig1.savefig("anchor_values_vs_tspec_multi_anchors_D4_D20.png", dpi=300, bbox_inches="tight")
+
+# -----------------------
+# Plot 2 (what you asked for): FHT_term vs T_build
+# -----------------------
+fig2, ax2 = plt.subplots(figsize=(12, 3))
+
+ax2.plot(res4["T_builds"],  res4["FHT_avg"],  marker='o', linewidth=2.2, label=r'$\textbf{FHT term} \ (N=4)$')
+ax2.plot(res20["T_builds"], res20["FHT_avg"], marker='s', linewidth=2.2, label=r'$\textbf{FHT term} \ (N=20)$')
+
+leg2 = ax2.legend(
+    prop={'size': 16, 'weight': 'bold'},
+    loc='upper left', bbox_to_anchor=(0.02, 0.98),
+    bbox_transform=ax2.transAxes,
+    ncol=1, frameon=True, framealpha=0.9,
+    borderpad=0.3, labelspacing=0.25,
+    handlelength=2.0, handletextpad=0.5, markerscale=0.9
+)
+
+ax2.xaxis.set_major_formatter(mticker.StrMethodFormatter(r'\textbf{{{x:g}}}'))
+ax2.yaxis.set_major_formatter(mticker.StrMethodFormatter(r'\textbf{{{x:g}}}'))
+ax2.xaxis.set_major_locator(mticker.MaxNLocator(integer=True))
+ax2.tick_params(axis="both", labelsize=18, length=8, width=2, pad=8)
+ax2.minorticks_off()
+ax2.tick_params(axis="both", which="minor", length=5, width=1.6)
+ax2.margins(x=0.08)
+ax2.set_xlabel(r'\textbf{$T_{\text{build}}$}')
+ax2.set_ylabel(r'\textbf{FHT term (avg over anchors)}')
+for s in ax2.spines.values():
+    s.set_linewidth(2)
+ax2.grid(False)
+
+fig2.tight_layout()
+fig2.savefig("fht_vs_tbuild_D4_D20.png", dpi=300, bbox_inches="tight")
+
+plt.show(block=True)   # keep interactive windows open
