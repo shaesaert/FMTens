@@ -31,7 +31,7 @@ from src.vis.dfa_tree_viz import plot_tree_layered
 # -----------------------
 # Continuous system (dim = optional dimensions, each 1D)
 # -----------------------
-dim = 9
+dim = 6
 
 # --- System ---
 # Initialize system dynamics containers
@@ -120,7 +120,7 @@ DFA, letters = dfa_manipulation(
 # -----------------------
 sysAbs: dict[int, Optional[np.ndarray]] = {i: None for i in range(dim)}
 for i in range(dim):
-    sysAbs[i] = MDPModel.from_system(sysLTI[i], nx=100, nu=5, placement='centers', u_placement='endpoints',
+    sysAbs[i] = MDPModel.from_system(sysLTI[i], nx=10, nu=5, placement='centers', u_placement='endpoints',
                             tol=1e-19, contract_sum=None, compute_P = '1d')
 
 # -----------------------
@@ -169,5 +169,8 @@ for it in range(1, T + 1):
 # Memory usage calculation
 mb = sum(np.asarray(G.V[d]).nbytes for d in range(len(G.V))) / (1024**2)
 print(f"Total G.V arrays: {mb:.2f} MB")
+
+from src.dynprog.utils.treebasedV import compute_tv_from_tree
+tv = compute_tv_from_tree(G, DFA, L, max_elements=50_000_000)
 
 exit = 1

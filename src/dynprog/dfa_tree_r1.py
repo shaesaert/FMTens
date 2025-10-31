@@ -24,9 +24,14 @@ class DFATree:
     """
 
     # ---------- construction ----------
-    def __init__(self, DFA, sysAbs, pol, nx_list, L, delta=None):
+    def __init__(self, DFA, sysAbs, pol, nx_list, L,
+                 delta_VI: Optional[Union[List[np.ndarray], tuple]] = None,
+                 delta_pol: Optional[Union[List[np.ndarray], tuple]] = None,
+                 pol_mode: Optional[str] = None,
+                 VI_mode: Optional[str] = None,
+                 iter_idx: Optional[int] = None):
         self.DFA = DFA
-
+        self.iter_idx = int(iter_idx) if iter_idx is not None else 0 # iteration
         # Normalize sysAbs / nx / L to aligned lists (allow dicts keyed 0..D-1)
         if isinstance(sysAbs, dict):
             self.dim_keys = sorted(sysAbs.keys())
@@ -49,23 +54,45 @@ class DFATree:
         # pol[q][d] is (N, nu) dense or csr one-hot (or None -> uniform)
         self.pol = pol
 
-        # === [optional Delta] ===
-        if delta is None:
-            self.delta: List[np.ndarray] = [np.zeros(self.nx[d], dtype=float) for d in range(self.dim)]
-        elif isinstance(delta, (list, tuple)):
-            if len(delta) != self.dim:
-                raise ValueError(f"delta list length {len(delta)} != dim {self.dim}")
-            self.delta = []
-            for d in range(self.dim):
-                vec = np.asarray(delta[d], dtype=float).ravel()
-                if vec.size != self.nx[d]:
-                    raise ValueError(f"delta[{d}] length {vec.size} != N_d ({self.nx[d]})")
-                # clamp negatives just in case
-                self.delta.append(np.maximum(vec, 0.0))
-        else:
-            raise TypeError("delta must be None or a list/tuple of vectors (one per dimension)")
 
-        # === end of delta
+
+        # === deltas for VI and policy (NEW, replaces old self.delta) ===
+        def _normalize_delta_like(name, inp):
+            if inp is None:
+                # default: zeros
+                return [np.zeros(self.nx[d], dtype=float) for d in range(self.dim)]
+            if not isinstance(inp, (list, tuple)) or len(inp) != self.dim:
+                raise ValueError(f"{name} must be list/tuple with length == dim ({self.dim})")
+            out = []
+            for d in range(self.dim):
+                vec = np.asarray(inp[d], dtype=float).ravel()
+                if vec.size != self.nx[d]:
+                    raise ValueError(f"{name}[{d}] length {vec.size} != N_d ({self.nx[d]})")
+                out.append(np.maximum(vec, 0.0))
+            return out
+
+        self.delta_VI  = _normalize_delta_like("delta_VI",  delta_VI)
+        self.delta_pol = _normalize_delta_like("delta_pol", delta_pol)
+
+        # === policy mode dispatch (NEW) ===
+        if pol_mode is None:
+            self.pol_mode = "rt"   # default: robusttree-like policy improvement
+        else:
+            pm = pol_mode.lower()
+            if pm not in {"rt", "apos"}:
+                raise ValueError("pol_mode must be 'rt' or 'apos'")
+            self.pol_mode = pm
+
+        # === VI mode dispatch (NEW) ===
+        if VI_mode is None:
+            self.VI_mode = "rt"    # default: robust VI (subtract delta_VI)
+        else:
+            vm = VI_mode.lower()
+            if vm not in {"rt", "apos"}:
+                raise ValueError("VI_mode must be 'rt' or 'apos'")
+            self.VI_mode = vm
+
+        print(f"[DFATree] Initialized (pol_mode={self.pol_mode}, VI_mode={self.VI_mode})")
 
         # Validate DFA is 0-based, consecutive
         S = list(np.asarray(DFA.S).ravel())
@@ -129,24 +156,6 @@ class DFATree:
 
         self.Dl = Dl
         self.tree.graph['Dl'] = Dl
-
-    # def _recompute_levels(self) -> None:
-    #     """
-    #     Recompute Dl: Dl[k] = list of node ids at graph distance k from root (0).
-    #     Also mirrors it onto self.tree.graph['Dl'] for convenient external access.
-    #     """
-    #     Dl: List[List[int]] = []
-    #     if 0 in self.tree:
-    #         lengths = nx.single_source_shortest_path_length(self.tree, 0)
-    #         if lengths:
-    #             maxd = max(lengths.values())
-    #             Dl = [[] for _ in range(maxd + 1)]
-    #             for n, d in lengths.items():
-    #                 Dl[d].append(int(n))
-    #             for lst in Dl:
-    #                 lst.sort()
-    #     self.Dl = Dl
-    #     self.tree.graph['Dl'] = Dl
 
     def Lq(self, n: int) -> int:
         """Return DFA state (0-based) stored on node n."""
@@ -336,13 +345,17 @@ class DFATree:
             else:
                 raise ValueError(f"{self.sysAbs[0].dim}>2 is not supported.")
 
-
             # self.V[d][n, :] = vx.ravel()
 
-            self.V[d][n, :] = np.maximum(vx.ravel() - self.delta[d], 0.0)
-
-
-
+            # --- VI_mode branching (NEW) ---
+            if self.VI_mode == "rt":
+                # robust VI: subtract delta_VI, clamp at 0
+                self.V[d][n, :] = np.maximum(vx.ravel() - self.delta_VI[d], 0.0)
+            elif self.VI_mode == "apos":
+                # a-posteriori VI: no subtraction here
+                self.V[d][n, :] = vx.ravel()
+            else:
+                raise RuntimeError(f"Unknown VI_mode: {self.VI_mode}")
 
     def update_tree(self) -> None:
         """Propagate values deepest→root, skipping the root itself."""
@@ -350,6 +363,68 @@ class DFATree:
             if n == 0:
                 continue
             self.update_node_value(n)
+    #  Q_n_apos
+
+    def Q_n_apos(self, n: int) -> List[np.ndarray]:
+        """
+        Per-dimension arrays Qv[d] with shape (N_d, nu_d), multiplied by the
+        a-posteriori weight zeta before returning.
+        """
+        # parent and label
+        parents = list(self.tree.predecessors(n))
+        if not parents:
+            return [np.zeros((self.nx[d], self._nu_of_dim(d)), dtype=float)
+                    for d in range(self.dim)]
+        nparent = parents[0]
+        l = int(self.tree.edges[nparent, n]["l"])  # 0-based label
+
+        # ----- compute zeta = 1 + delta_bold * (iter - l_n - 1) -----
+        # l_n := parent depth of node n
+        depths = nx.single_source_shortest_path_length(self.tree, 0)  # node -> depth
+        dep_n = int(depths.get(n, 0))
+        l_n = max(dep_n , 0)
+
+        iter_idx = self.iter_idx
+
+        # delta_bold from self.delta_pol
+        delta_scalars = []
+        for dd in range(self.dim):
+            deltad = np.asarray(self.delta_pol[dd], dtype=float).ravel()
+            delta_scalars.append(float(deltad.max() if deltad.size else 0.0))
+        delta_bold = 1.0 - float(np.prod([1.0 - s for s in delta_scalars]))
+
+        zeta = 1.0 + delta_bold * (iter_idx - l_n )
+
+
+        # ----- build Qv and scale by zeta -----
+        Qv: List[np.ndarray] = []
+        for d in range(self.dim):
+            N = self.nx[d]
+            P_attr = getattr(self.sysAbs[d], "P", None)
+
+            mask_row = np.asarray(self.L[d][l, :], dtype=float).reshape(1, -1)
+            v_parent_row = np.asarray(self.V[d][nparent, :], dtype=float).reshape(1, -1)
+            w = mask_row * v_parent_row  # (1, N)
+
+            if self.sysAbs[0].dim == 1:
+                P_flat = P_attr  # (N, N*nu)
+                nu = P_flat.shape[1] // N
+                prod = np.asfortranarray(w) @ P_flat  # (1, N*nu)
+                Qv_d = np.reshape(prod, (N, nu), order='F')
+                Qv_d *= zeta
+                Qv.append(Qv_d)
+
+            elif self.sysAbs[0].dim == 2:
+                nu = P_attr.a
+                prod = np.asfortranarray(w) @ P_attr.stoch
+                Qv_d = np.reshape(prod, (N, nu), order='F')
+                Qv_d *= zeta
+                Qv.append(Qv_d)
+
+            else:
+                raise ValueError(f"{self.sysAbs[0].dim}>2 is not supported.")
+
+        return Qv
 
     # ---------- Q-values for policy improvement ----------
     def Q_n(self, n: int) -> List[np.ndarray]:
@@ -405,11 +480,114 @@ class DFATree:
 
         return Qv
 
-
+    def set_iter(self, i: int) -> None:
+        self.iter_idx = int(i)
     # ---------- policy improvement ----------
     def maxpolicy(self, rho):
         """
-        Stateless greedy improvement:
+        Dispatch to method-specific maxpolicy versions depending on the policy mode.
+        pol_mode:
+          'rt'   -> robusttree
+          'apos' -> aposteriori
+        """
+        mode = self.pol_mode
+        print(f"[maxpolicy] Using policy mode: {mode}")
+        if mode == "apos":
+            return self._maxpolicy_aposteriori(rho)
+        elif mode == "rt":
+            return self._maxpolicy_robusttree(rho)
+        else:
+            raise RuntimeError(f"Unknown pol_mode: {mode}")
+
+    def _maxpolicy_aposteriori(self, rho):
+        """
+        Stateless greedy improvement (original logic):
+          - uses UNIFORM policy to compute c[d]
+          - computes greedy actions per (q,d)
+          - updates ONLY self.Pxx[q][d] in-place
+        """
+        import numpy as np
+        import scipy.sparse as sparse
+        import networkx as nx
+
+        num_states = len(self.DFA.S)
+        pol = np.empty((num_states, self.dim), dtype=object)
+
+        # states to skip (final/sink)
+        skip = {int(self.DFA.F)}
+        if hasattr(self.DFA, "sink") and getattr(self.DFA, "sink") is not None:
+            skip.add(int(self.DFA.sink))
+
+        depths = nx.single_source_shortest_path_length(self.tree, 0)
+
+        delta_scalars = []
+        for d in range(self.dim):
+            deltad = np.asarray(self.delta_pol[d], dtype=float).ravel()
+            delta_scalars.append(float(deltad.max() if deltad.size else 0.0))
+        delta_bold = 1.0 - float(np.prod([1.0 - s for s in delta_scalars]))
+
+        # helper: dense uniform policy for a dimension d
+        def uniform_pol_dense(d: int) -> np.ndarray:
+            N = self.nx[d]
+            nu = self._nu_of_dim(d)
+            return np.full((N, nu), 1.0 / nu, dtype=float)
+
+        for q in set(self.DFA.S) - skip:
+            # If there's no Q for this state, refresh cache with uniform policy and continue
+            if not self.Q[q]:
+                for d in range(self.dim):
+                    P_src = self.sysAbs[d].P_flat if self.sysAbs[d].P_flat is not None else self.sysAbs[d].P
+                    self.Pxx[q][d] = Pc(P_src, uniform_pol_dense(d))
+                continue
+
+            # accumulate per-dimension scores
+            Vxa = [np.zeros((self.nx[d], self._nu_of_dim(d)), dtype=float)
+                   for d in range(self.dim)]
+
+
+            # iterate over all n in Q[q]
+            for n in self.Q[q]:
+                Qv = self.Q_n(n)  # list of arrays, each (N_d, nu_d)
+                Qv_apos = self.Q_n_apos(n)
+
+                # constants c[d] using UNIFORM policy
+                c = np.zeros(self.dim, dtype=float)
+                for d in range(self.dim):
+                    pol_dense = uniform_pol_dense(d)  # (N_d, nu_d)
+                    vec = np.sum(Qv[d] * pol_dense, axis=1)  # (N_d,)
+                    c[d] = float(np.asarray(rho[d]).ravel() @ vec)  # scalar
+
+                # scale[d] = prod(c) / c[d] (handle zeros safely)
+                prod_c = float(np.prod(c)) if self.dim > 0 else 1.0
+                scale = np.divide(prod_c, c, out=np.zeros_like(c), where=(c != 0))
+
+                # accumulate contribution to Vxa[d]
+                for d in range(self.dim):
+                    contrib = np.nan_to_num(
+                        Qv_apos[d] * scale[d],
+                        nan=0.0, posinf=0.0, neginf=0.0
+                    )  # (N_d, nu_d)
+                    Vxa[d] += contrib
+
+            # greedy argmax per dimension -> update ONLY Pxx
+            for d in range(self.dim):
+                I = np.argmax(Vxa[d], axis=1)  # choose best action per state row
+                rows = np.arange(Vxa[d].shape[0])
+                pol[q][d] = sparse.csr_matrix(
+                    (np.ones_like(rows, dtype=float), (rows, I)),
+                    shape=Vxa[d].shape
+                )
+                P_src = self.sysAbs[d].P_flat if self.sysAbs[d].P_flat is not None else self.sysAbs[d].P
+                self.Pxx[q][d] = Pc(P_src, pol[q][d])
+
+        self._last_greedy_pol = pol  # for debug
+        return self.Pxx
+
+
+
+    def _maxpolicy_robusttree(self, rho):
+        """
+        Stateless greedy improvement (original logic):
           - uses UNIFORM policy to compute c[d]
           - computes greedy actions per (q,d)
           - updates ONLY self.Pxx[q][d] in-place
@@ -437,7 +615,6 @@ class DFATree:
                 for d in range(self.dim):
                     P_src = self.sysAbs[d].P_flat if self.sysAbs[d].P_flat is not None else self.sysAbs[d].P
                     self.Pxx[q][d] = Pc(P_src, uniform_pol_dense(d))
-                    # self.Pxx[q][d] = Pc(self.sysAbs[d].P_flat, uniform_pol_dense(d))
                 continue
 
             # accumulate per-dimension scores
@@ -448,8 +625,9 @@ class DFATree:
             for n in self.Q[q]:
                 Qv = self.Q_n(n)  # list of arrays, each (N_d, nu_d)
 
+                # --- robust pre-subtraction using delta_pol (NEW) ---
                 for d in range(self.dim):
-                    Qv[d] = np.maximum(Qv[d] - self.delta[d][:, None], 0.0)
+                    Qv[d] = np.maximum(Qv[d] - self.delta_pol[d][:, None], 0.0)
 
                 # constants c[d] using UNIFORM policy
                 c = np.zeros(self.dim, dtype=float)
@@ -460,7 +638,6 @@ class DFATree:
 
                 # scale[d] = prod(c) / c[d] (handle zeros safely)
                 prod_c = float(np.prod(c)) if self.dim > 0 else 1.0
-                # where c[d] == 0, use 0.0 to avoid Inf; we'll also nan_to_num below
                 scale = np.divide(prod_c, c, out=np.zeros_like(c), where=(c != 0))
 
                 # accumulate contribution to Vxa[d]
@@ -482,6 +659,7 @@ class DFATree:
                 P_src = self.sysAbs[d].P_flat if self.sysAbs[d].P_flat is not None else self.sysAbs[d].P
                 self.Pxx[q][d] = Pc(P_src, pol[q][d])
 
+        self._last_greedy_pol = pol # for debug
         return self.Pxx
 
     # ---------- pruning / relabeling ----------
@@ -589,6 +767,184 @@ class DFATree:
 
         # update levels Dl
         self._recompute_levels()
+
+    # -------- stopping criterion- region mean ------
+    def approx_region_mean_sampling(
+            self,
+            idx_bounds,
+            K: int = 2000,
+            seed: int | None = None,
+    ) -> float:
+        """
+        Monte Carlo estimate of the average 'tv-like' value over a rectangular
+        region of the joint state grid, WITHOUT building the full tv tensor.
+
+        This matches the logic you were using in MATLAB conceptually:
+          value(x) = max_{n in candidate_nodes}  Π_d V[d][n, x_d]
+
+        where:
+          - candidate_nodes = all tree nodes whose DFA mode is "not done yet"
+            (i.e. skip accepting and sink states)
+          - V[d][n, :] is the value row for node n in dimension d
+          - x_d is the abstract state index in dimension d
+
+        We then average value(x) over K random samples x drawn uniformly from
+        the specified hyper-rectangle.
+
+        Parameters
+        ----------
+        idx_bounds : list[tuple[int,int]]
+            Per-dimension inclusive index ranges.
+
+            You can provide fewer than self.dim ranges.
+            For any missing dimension d, we default to the entire domain [0, N_d-1].
+
+            Example (2D region in a higher-D system):
+                idx_bounds = [(0, 798), (599, 699)]
+            If self.dim == 5, dims 2..4 will automatically use (0, N_d-1).
+
+        K : int
+            Number of Monte Carlo samples.
+
+        seed : int | None
+            RNG seed. IMPORTANT: keep this FIXED across iterations if you're
+            using this as a convergence/stopping metric, so noise doesn't
+            trigger early stopping.
+
+        Returns
+        -------
+        float
+            Estimated mean of value(x) over that region.
+        """
+        import numpy as np
+
+        rng = np.random.default_rng(seed)
+
+        D = self.dim  # number of independent subsystems / dims
+        N_per_dim = self.nx  # list of grid sizes per dim, length D
+
+        # -------- normalize / clip bounds per dimension --------
+        # build lo[d], hi[d] for d=0..D-1
+        lo = np.zeros(D, dtype=int)
+        hi = np.zeros(D, dtype=int)
+
+        for d in range(D):
+            if d < len(idx_bounds):
+                lo_d, hi_d = idx_bounds[d]
+            else:
+                # no bound provided for this dim -> use full range
+                lo_d, hi_d = 0, N_per_dim[d] - 1
+
+            # clip to valid range
+            lo_d = max(0, min(N_per_dim[d] - 1, int(lo_d)))
+            hi_d = max(0, min(N_per_dim[d] - 1, int(hi_d)))
+
+            if hi_d < lo_d:
+                # empty region in this dim ⇒ region volume is 0 ⇒ mean = 0
+                return 0.0
+
+            lo[d] = lo_d
+            hi[d] = hi_d
+
+        # -------- gather candidate nodes (non-accepting, non-sink DFA states) --------
+        skip_states = {int(self.DFA.F)}
+        if hasattr(self.DFA, "sink") and getattr(self.DFA, "sink") is not None:
+            skip_states.add(int(self.DFA.sink))
+
+        cand_nodes = []
+        for q in self.DFA.S:
+            q_int = int(q)
+            if q_int in skip_states:
+                continue
+            cand_nodes.extend(self.Q.get(q_int, []))
+
+        # if (pathologically) empty, fall back to *all* existing nodes so we don't just return 0
+        if not cand_nodes:
+            cand_nodes = list(self.tree.nodes)
+
+        # deduplicate to avoid double-counting same node
+        cand_nodes = list({int(n) for n in cand_nodes})
+
+        if not cand_nodes:
+            return 0.0
+
+        # -------- Monte Carlo sampling --------
+        total_val = 0.0
+        K_int = int(K)
+
+        for _ in range(K_int):
+            # sample one joint abstract state index x = (i_0, ..., i_{D-1})
+            idx_vec = [
+                rng.integers(low=lo[d], high=hi[d] + 1)
+                for d in range(D)
+            ]
+
+            # compute value(x) = max_n prod_d V[d][n, idx_vec[d]]
+            best_val = 0.0
+            for n in cand_nodes:
+                prod_val = 1.0
+                # multiply across dims
+                for d in range(D):
+                    v_d = float(self.V[d][n, idx_vec[d]])
+                    if v_d <= 0.0:
+                        prod_val = 0.0
+                        break
+                    prod_val *= v_d
+
+                if prod_val > best_val:
+                    best_val = prod_val
+
+            total_val += best_val
+
+        mean_est = total_val / float(K_int)
+        return float(mean_est)
+
+    def progress_check(
+            self,
+            idx_bounds,
+            prev_score: float | None,
+            K: int,
+            tol_growth: float,
+            seed: int | None = None,
+            it: int | None = None,
+    ):
+        """
+        Convenience helper for the stopping heuristic:
+          1. compute current approx region-mean score
+          2. compute gain vs prev_score (if any)
+          3. decide whether to stop (gain <= tol_growth)
+
+        Returns:
+            score        : float
+            gain         : float or None
+            stop_now     : bool
+        Also prints the debug lines for you.
+        """
+        score = self.approx_region_mean_sampling(
+            idx_bounds=idx_bounds,
+            K=K,
+            seed=seed,
+        )
+
+        # always print score
+        print(f"  approx region-mean score = {score:.6e}")
+
+        if prev_score is None:
+            # first iteration: no gain, don't stop
+            return score, None, False
+
+        gain = score - prev_score
+        print(f"  gain since last iter    = {gain:.3e}")
+
+        if gain <= tol_growth:
+            # plateau → suggest stop
+            if it is not None:
+                print(f"  -> stopping early at iter {it} (plateau)")
+            else:
+                print("  -> stopping early (plateau)")
+            return score, gain, True
+
+        return score, gain, False
 
     # ---------- plotting ----------
     def plot(self, use_letters: bool = False) -> None:

@@ -25,6 +25,7 @@ from src.models.mdpmodel import MDPModel
 from src.specifications.translate import translate
 from src.specifications.utils.dfa_tool import dfa_manipulation
 from src.abstraction.utils.labeling import dim_label
+from src.abstraction.utils.labeling import dim_label_eps
 from src.dynprog.dfa_tree_r1 import DFATree
 from src.vis.dfa_tree_viz import plot_tree_layered
 
@@ -125,7 +126,17 @@ for i in range(dim):
 # -----------------------
 # Labeling
 # -----------------------
-L = dim_label(sysAbs, sysLTI, letters, visualize=True)
+eps_val = 0.1  # this is your robustness margin
+
+L = dim_label_eps(
+    sysAbs,
+    sysLTI,
+    letters,
+    eps=eps_val,
+    visualize=True,  # or True if you want plots
+    outdir=None,  # or "some/folder" if visualize=True
+    prefix="L_eps"
+)
 
 # -----------------------
 # Policy (randomized uniform) & rho
@@ -177,13 +188,13 @@ for it in range(1, T + 1):
     G.grow()
     plot_tree_layered(G)
 
-# 3) Compute lb(satProb) based on tree
-from src.dynprog.utils.treebasedV import compute_tv_from_tree
-tv = compute_tv_from_tree(G, DFA, L, max_elements=50_000_000)
-
-if apos == 1:
-    from src.dynprog.utils.v_apos import apply_delta_correction_apos
-    tv = apply_delta_correction_apos(tv, G, DFA, L, sysAbs, delta_sys=delta_sys, T=T)
+# # 3) Compute lb(satProb) based on tree
+# from src.dynprog.utils.treebasedV import compute_tv_from_tree
+# tv = compute_tv_from_tree(G, DFA, L, max_elements=50_000_000)
+#
+# if apos == 1:
+#     from src.dynprog.utils.v_apos import apply_delta_correction_apos
+#     tv = apply_delta_correction_apos(tv, G, DFA, L, sysAbs, delta_sys=delta_sys, T=T)
 
 
 exit = 1
