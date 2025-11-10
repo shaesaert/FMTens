@@ -332,6 +332,7 @@ mpl.rcParams.update({
     "axes.labelsize": 16,  # axis label size
     "legend.fontsize": 14, # legend size
 })
+
 mpl.use("QtAgg")  # interactive window
 
 import matplotlib.pyplot as plt
@@ -534,7 +535,7 @@ idx_bounds = [(0, 798), (599, 699)]
 
 prune_tol = float(ask("Enter prune tol [default 5e-3]:", "0.005"))
 K_samp = 2000
-T = 7
+T = 6
 tol_growth = 1e-8
 for it in range(1, T + 1):
     print(f"\n=== Iteration {it} (VI_mode={VI_mode}, pol_mode={pol_mode}) ===")
@@ -592,16 +593,36 @@ def remove_titles(fig=None):
             ax.set_title("")
         except Exception:
             pass
+from matplotlib.ticker import FuncFormatter
+
+def force_bold_ticklabels_tex(ax, fmt="{x:g}", bold_minus=False):
+    """
+    Make major tick labels bold using TeX.
+    - fmt: python format string for numbers (e.g. "{x:.2f}")
+    - bold_minus: if True, also bolds the minus sign via \\boldsymbol
+    """
+    def _one(v, pos):
+        s = fmt.format(x=v)
+        if bold_minus and s.startswith("-"):
+            # Bold minus and digits (requires \\usepackage{bm} in your LaTeX preamble)
+            return rf"$\boldsymbol{{-{s[1:]}}}$"
+        return rf"$\mathbf{{{s}}}$"   # bold digits; minus stays normal weight
+
+    ax.xaxis.set_major_formatter(FuncFormatter(_one))
+    ax.yaxis.set_major_formatter(FuncFormatter(_one))
+
 
 def style_axes_bold_labels_ticks(fig=None):
     """Bold axis labels x_1(0), x_2(0) and tick labels for all axes in the figure."""
     fig = fig or plt.gcf()
     for ax in fig.axes:
-        ax.set_xlabel(r'$\boldsymbol{x_1(0)}$')
-        ax.set_ylabel(r'$\boldsymbol{x_2(0)}$')
+        ax.set_xlabel(r'$\boldsymbol{x_{1,0}}$')
+        ax.set_ylabel(r'$\boldsymbol{x_{2,0}}$')
         for lbl in ax.get_xticklabels() + ax.get_yticklabels():
             lbl.set_fontweight('bold')
         ax.tick_params(axis="both", which="both", width=1.6, length=6)
+        force_bold_ticklabels_tex(ax)
+
 
 plotV_rank1(sysAbs, tv)
 remove_titles()

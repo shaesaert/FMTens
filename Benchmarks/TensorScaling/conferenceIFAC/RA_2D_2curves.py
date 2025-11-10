@@ -172,8 +172,8 @@ def main():
     ap.add_argument("--delta-corr",     type=str, default="", help="per-dim δ for a-posteriori correction of tv_apos")
 
     ap.add_argument("--prune-tol", type=float, default=1e-15, help="pruning tolerance for leafs")
-    ap.add_argument("--rows", type=str, default="0,798", help="row range inclusive as 'r0,r1' (default '0,798')")
-    ap.add_argument("--cols", type=str, default="599,699", help="col range inclusive as 'c0,c1' (default '599,699')")
+    ap.add_argument("--rows", type=str, default="0,799", help="row range inclusive as 'r0,r1' (default '0,799')")
+    ap.add_argument("--cols", type=str, default="600,699", help="col range inclusive as 'c0,c1' (default '600,699')")
     ap.add_argument("--out-prefix", type=str, default="outputs/rt_apos_two_curves",
                     help="output prefix for files")
     args, _ = ap.parse_known_args()
