@@ -85,7 +85,7 @@ for i in range(dim):
     safeset = safeset + f' & p1{i}'
     AP.update(sysLTI[i].AP)
 
-    # Clean up safeset string
+    # Clean up safeset stringf
     if i == 0:
         safeset = safeset[3:]  # Remove initial ' & '
 

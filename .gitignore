@@ -5,6 +5,8 @@ __pycache__/
 
 # C extensions
 *.so
+.DS_Store
+
 
 # Distribution / packaging
 .Python
@@ -160,3 +162,8 @@ cython_debug/
 #  and can be added to the global gitignore or merged into this file.  For a more nuclear
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
+Benchmarks/TensorScaling/.DS_Store
+Benchmarks/TensorScaling/conferenceIFAC/.DS_Store
+Benchmarks/.DS_Store
+Benchmarks/TensorScaling/conferenceIFAC/.DS_Store
+Benchmarks/TensorScaling/.DS_Store
