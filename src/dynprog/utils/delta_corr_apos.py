@@ -72,7 +72,7 @@ def weighted_vtens_sum_per_state(G, T: int, non_final_states, dims=None):
         level_nodes = set(_level_indices(G, i, bucket='both'))
         if not level_nodes:
             continue
-        w = (T - i)
+        w = (T - i) # w is T-length(z)
         # accumulate per state at this level
         for q in non_final_states:
             q = int(q)

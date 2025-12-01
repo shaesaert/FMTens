@@ -1,5 +1,3 @@
-
-
 # -----------------------
 # Load modified modules if needed
 # -----------------------
@@ -16,27 +14,8 @@ reload(DFATree_mod)
 
 import numpy as np
 import polytope as pc
-import gc
-
-# -----------------------
-# Matplotlib config: match isolate_Gd_drives_G0_copyPxx.py
-# (must be BEFORE importing pyplot)
-# -----------------------
-import matplotlib as mpl
-mpl.rcParams['text.usetex'] = True
-mpl.rcParams['text.latex.preamble'] = r'\usepackage{amsmath}\usepackage{bm}'
-mpl.rcParams.update({
-    "font.family": "DejaVu Sans",
-    "mathtext.fontset": "dejavusans",
-    "text.usetex": True,
-    "font.size": 14,       # base text size
-    "axes.labelsize": 16,  # axis label size
-    "legend.fontsize": 14, # legend size
-})
-
-mpl.use("QtAgg")  # interactive window
-
 import matplotlib.pyplot as plt
+import gc
 
 # from pathlib import Path; import h5py
 from src.models.linmodel import LinModel
@@ -48,6 +27,7 @@ from src.abstraction.utils.labeling import dim_label_eps
 from src.performance.memory_check import print_workspace_memory
 from src.dynprog.dfa_tree_r1 import DFATree
 from src.vis.dfa_tree_viz import plot_tree_layered
+from src.vis.dfa_tree_viz import plot_tree_layered_heatnode
 from src.dynprog.utils.treebasedV import compute_tv_from_tree
 from src.vis.plot_tv import plotV_rank1
 from src.config.delta_ui import parse_delta_list  # parse single/CSV -> per-dim scalars
@@ -74,22 +54,6 @@ def make_delta_vectors_from_scalars(scalars, sysAbs) -> list:
         N = sysAbs[k].N
         out.append(np.full(N, float(scalars[i]), dtype=float))
     return out
-
-def region_mean_exact(tv: np.ndarray, r0: int, r1: int, c0: int, c1: int) -> float:
-    """
-    Exact region mean (for debugging/diagnostics at the very end).
-    """
-    if tv.ndim != 2:
-        raise ValueError(f"Expected 2D tv; got shape {tv.shape}")
-    nrows, ncols = tv.shape
-    rr0 = max(0, min(nrows-1, r0))
-    rr1 = max(0, min(nrows-1, r1))
-    cc0 = max(0, min(ncols-1, c0))
-    cc1 = max(0, min(ncols-1, c1))
-    if rr1 < rr0 or cc1 < cc0:
-        return 0.0
-    sub = tv[rr0:rr1+1, cc0:cc1+1]
-    return float(np.mean(sub))
 
 
 # -----------------------
@@ -165,6 +129,10 @@ sysAbs = {
 # -----------------------
 # Labeling
 # -----------------------
+# L = dim_label(sysAbs, sysLTI, letters, visualize=True)
+# assume you already have:
+#   sysAbs, sysLTI, DFA, letters
+
 eps_val = 0.1  # robustness margin
 L = dim_label_eps(
     sysAbs,
@@ -175,6 +143,7 @@ L = dim_label_eps(
     outdir=None,
     prefix="L_eps"
 )
+
 
 # -----------------------
 # Policy (uniform) & rho
@@ -195,13 +164,13 @@ L_list  = [L[k] for k in dims]
 # Ask for modes and deltas
 # -----------------------
 VI_mode = ask_mode("Choose VI_mode", default="rt")   # 'rt' or 'apos'
-deltaVI_in = ask("Enter Δ_VI (single or CSV) [default 0.0084] (If apos VI_mode, input 0):", "0.0084")
-deltaVI_scalars = parse_delta_list(deltaVI_in, len(dims), default=0.0084)
+deltaVI_in = ask("Enter Δ_VI (single or CSV) [default 0.001] (If apos VI_mode, input 0):", "0.001")
+deltaVI_scalars = parse_delta_list(deltaVI_in, len(dims), default=0.001)
 delta_VI_vecs = make_delta_vectors_from_scalars(deltaVI_scalars, sysAbs)
 
 pol_mode = ask_mode("Choose pol_mode", default="rt")  # 'rt' or 'apos'
-deltaPol_in = ask("Enter Δ_pol (single or CSV) [default 0.0084]:", "0.0084")
-deltaPol_scalars = parse_delta_list(deltaPol_in, len(dims), default=0.0084)
+deltaPol_in = ask("Enter Δ_pol (single or CSV) [default 0.001]:", "0.001")
+deltaPol_scalars = parse_delta_list(deltaPol_in, len(dims), default=0.001)
 delta_pol_vecs = make_delta_vectors_from_scalars(deltaPol_scalars, sysAbs)
 
 # --- NEW: user-defined apos correction delta ---
@@ -209,7 +178,7 @@ apos_corr_in = ask("Enter Δ for a-posteriori correction (apos_correction_delta)
 if apos_corr_in.strip() == "":
     apos_corr_scalars = deltaPol_scalars
 else:
-    apos_corr_scalars = parse_delta_list(apos_corr_in, len(dims), default=0.0084)
+    apos_corr_scalars = parse_delta_list(apos_corr_in, len(dims), default=0.001)
 
 print(f"\nConfig:")
 print(f"  VI_mode={VI_mode}, Δ_VI scalars={deltaVI_scalars}")
@@ -234,56 +203,41 @@ final_iter   = 0
 score_history = []
 idx_bounds = [(0, 798), (599, 699)]
 
+
+# T = int(ask("Enter build depth T [default 20]:", "20"))
 prune_tol = float(ask("Enter prune tol [default 5e-3]:", "0.005"))
 K_samp = 2000
-T = 6
+T = 1
+
 tol_growth = 1e-8
 for it in range(1, T + 1):
-    print(f"\n=== Iteration {it} (VI_mode={VI_mode}, pol_mode={pol_mode}) ===")
     G.set_iter(it)
+    print(f"\n=== Iteration {it} (VI_mode={VI_mode}, pol_mode={pol_mode}) ===")
     G.maxpolicy(rho)              # uses pol_mode & delta_pol internally
     G.update_tree()               # uses VI_mode & delta_VI internally
     G.prune(prune_tol, 'leafs')
+    # G.prune2(prune_tol)
+    # plot_tree_layered(G)
     G.grow()
 
-    score, gain, stop_now = G.progress_check(
-        idx_bounds=idx_bounds,
-        prev_score=prev_score,
-        K=K_samp,
-        tol_growth=tol_growth,
-        seed=fixed_seed,
-        it=it,
-    )
+plot_tree_layered(G)
 
-    score_history.append(score)
-    final_iter = it
-    prev_score = score
-
-    if stop_now:
-        break
-
-    # Optional visualize:
-    plot_tree_layered(G)
-
-# -----------------------
-# Compute tv and optional APoS correction
-# -----------------------
 tv, node_outer_max = compute_tv_from_tree(G, DFA, L, max_elements=50_000_000)
+
+plot_tree_layered_heatnode(G, DFA, node_outer_max=node_outer_max)
 
 if pol_mode == 'apos':
     from src.dynprog.utils.v_apos import apply_delta_correction_apos
     tv = apply_delta_correction_apos(tv, G, DFA, L, sysAbs,
                                      delta_sys=apos_corr_scalars, T=it+1)
 
-gc.collect()
-
-print_workspace_memory(globals(), label="end-of-run")
 
 # -----------------------
-# visualize satProb (match styling of the comparison script)
+# visualize satProb
 # -----------------------
 def remove_titles(fig=None):
     """Remove suptitle and all axes titles from the current (or given) figure."""
+    import matplotlib.pyplot as plt
     fig = fig or plt.gcf()
     try:
         fig._suptitle = None
@@ -294,37 +248,17 @@ def remove_titles(fig=None):
             ax.set_title("")
         except Exception:
             pass
-from matplotlib.ticker import FuncFormatter
-
-def force_bold_ticklabels_tex(ax, fmt="{x:g}", bold_minus=False):
-    """
-    Make major tick labels bold using TeX.
-    - fmt: python format string for numbers (e.g. "{x:.2f}")
-    - bold_minus: if True, also bolds the minus sign via \\boldsymbol
-    """
-    def _one(v, pos):
-        s = fmt.format(x=v)
-        if bold_minus and s.startswith("-"):
-            # Bold minus and digits (requires \\usepackage{bm} in your LaTeX preamble)
-            return rf"$\boldsymbol{{-{s[1:]}}}$"
-        return rf"$\mathbf{{{s}}}$"   # bold digits; minus stays normal weight
-
-    ax.xaxis.set_major_formatter(FuncFormatter(_one))
-    ax.yaxis.set_major_formatter(FuncFormatter(_one))
-
 
 def style_axes_bold_labels_ticks(fig=None):
     """Bold axis labels x_1(0), x_2(0) and tick labels for all axes in the figure."""
+    import matplotlib.pyplot as plt
     fig = fig or plt.gcf()
     for ax in fig.axes:
-        ax.set_xlabel(r'$\boldsymbol{x_{1,0}}$')
-        ax.set_ylabel(r'$\boldsymbol{x_{2,0}}$')
+        ax.set_xlabel(r'$\boldsymbol{x_1(0)}$')
+        ax.set_ylabel(r'$\boldsymbol{x_2(0)}$')
         for lbl in ax.get_xticklabels() + ax.get_yticklabels():
             lbl.set_fontweight('bold')
         ax.tick_params(axis="both", which="both", width=1.6, length=6)
-        force_bold_ticklabels_tex(ax)
-
-
 plotV_rank1(sysAbs, tv)
 remove_titles()
 style_axes_bold_labels_ticks()
@@ -332,4 +266,6 @@ style_axes_bold_labels_ticks()
 plt.show()
 
 exit = 0
+
+
 

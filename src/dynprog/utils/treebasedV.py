@@ -18,7 +18,7 @@ def _fmt_bytes(n):
         n /= 1024
     return f"{n:.2f} PiB"
 
-def compute_tv_from_tree(G, DFA, L, *, max_elements = 50_000_000,max_bytes=None):
+def compute_tv_from_tree(G, DFA, L, *, max_elements=50_000_000, max_bytes=None):
     """
     Build satProb 'tv' from the DFA tree and per-letter labeling L for ANY number of dimensions.
 
@@ -27,8 +27,10 @@ def compute_tv_from_tree(G, DFA, L, *, max_elements = 50_000_000,max_bytes=None)
       - L[d] has shape (n_letters, N_d) for each dimension d
       - DFA.S, DFA.F, DFA.S0, DFA.trans, DFA.act as usual
 
-    Output:
+    Returns:
       - tv: an N-dimensional ndarray with shape (N_0, N_1, ..., N_{D-1})
+      - node_outer_max: dict mapping node index -> max(node_outer) for nodes
+        that actually contribute non-zero probability
     """
     q0 = int(DFA.S0[0])
     nQ = len(DFA.S)
@@ -55,7 +57,7 @@ def compute_tv_from_tree(G, DFA, L, *, max_elements = 50_000_000,max_bytes=None)
             "compute_tv_from_tree: arrays too large to build safely.\n"
             f"  shape={tv_shape} → {total_elems:,} elems\n"
             f"  one array ≈ {_fmt_bytes(est_bytes_one)}; "
-            f"working set ≈ {_fmt_bytes(est_bytes_work)} (≈(|S|+1) arrays)\n"
+            f"  working set ≈ {_fmt_bytes(est_bytes_work)} (≈(|S|+1) arrays)\n"
             f"  limit ≈ {_fmt_bytes(limit_bytes)} "
             f"(tune with max_elements or max_bytes)"
         )
@@ -76,12 +78,44 @@ def compute_tv_from_tree(G, DFA, L, *, max_elements = 50_000_000,max_bytes=None)
 
     # ---- accumulate contributions from nodes grouped by their DFA state ----
     non_final_states = [int(q) for q in DFA.S if int(q) != int(DFA.F)]
+
+    nodes_with_prob = []
+    nodes_no_prob = []
+    node_outer_max = {}  # standalone container for visualization
+
+    # IMPORTANT: loop only over non_final_states to keep tv identical to original
     for q in non_final_states:
         Mq = mask_q[q]
         # for each node n that carries DFA state q
         for n in G.Q.get(q, []):
             node_vecs = [G.V[d][n, :] for d in range(D)]
-            tv += Mq * _outer_nd(node_vecs)
+            node_outer = _outer_nd(node_vecs)
+            contrib = Mq * node_outer
 
-    return tv
+            if np.any(contrib != 0.0):
+                nodes_with_prob.append(n)
+                # store max(node_outer) (keep the largest if ever seen multiple times)
+                m = float(node_outer.max())
+                prev = node_outer_max.get(n, 0.0)
+                if m > prev:
+                    node_outer_max[n] = m
+            else:
+                nodes_no_prob.append(n)
 
+            # tv accumulation is exactly as in the original version
+            tv += contrib
+
+    # ---- grouped diagnostics at the end (optional) ----
+    if nodes_with_prob:
+        uniq = sorted(set(nodes_with_prob))
+        print("probability lying in nodes :" + ",".join(str(i) for i in uniq))
+    else:
+        print("probability lying in nodes :(none)")
+
+    if nodes_no_prob:
+        uniq0 = sorted(set(nodes_no_prob))
+        print("no probability at all lying in nodes:" + ",".join(str(i) for i in uniq0))
+    else:
+        print("no probability at all lying in nodes:(none)")
+
+    return tv, node_outer_max

@@ -13,6 +13,8 @@ import argparse
 import os
 import numpy as np
 import matplotlib as mpl
+from mean_apos_corr_curve_data_mtl import mean_apos_corr_curve_mtl as curve_mtl
+curve_mtl  = np.asarray(curve_mtl, dtype=float)
 
 # --- Matplotlib config (must be before pyplot import) ---
 mpl.rcParams['text.usetex'] = True
@@ -172,8 +174,8 @@ def main():
     ap.add_argument("--delta-corr",     type=str, default="", help="per-dim δ for a-posteriori correction of tv_apos")
 
     ap.add_argument("--prune-tol", type=float, default=1e-15, help="pruning tolerance for leafs")
-    ap.add_argument("--rows", type=str, default="0,799", help="row range inclusive as 'r0,r1' (default '0,799')")
-    ap.add_argument("--cols", type=str, default="600,699", help="col range inclusive as 'c0,c1' (default '600,699')")
+    ap.add_argument("--rows", type=str, default="0,595", help="row range inclusive as 'r0,r1' (default '0,595')")
+    ap.add_argument("--cols", type=str, default="0,998", help="col range inclusive as 'c0,c1' (default '0,998')")
     ap.add_argument("--out-prefix", type=str, default="outputs/rt_apos_two_curves",
                     help="output prefix for files")
     args, _ = ap.parse_known_args()
@@ -238,8 +240,8 @@ def main():
     mean_apos_corr_curve = []
 
     # ---- T = 0 ----
-    tv_rt   = compute_tv_from_tree(G_rt,   DFA, L)
-    tv_apos = compute_tv_from_tree(G_apos, DFA, L)
+    tv_rt , node_outer_max_rt  = compute_tv_from_tree(G_rt,   DFA, L)
+    tv_apos, node_outer_max_apos  = compute_tv_from_tree(G_apos, DFA, L)
     tv_apos_corr = apply_delta_correction_apos(tv_apos, G_apos, DFA, L, sysAbs,
                                                delta_sys=delta_corr_scalars, T=0)
 
@@ -267,10 +269,10 @@ def main():
         G_apos.grow()
 
         # Recompute tvs after this horizon
-        tv_rt   = compute_tv_from_tree(G_rt,   DFA, L)
-        tv_apos = compute_tv_from_tree(G_apos, DFA, L)
+        tv_rt , node_outer_max_rt  = compute_tv_from_tree(G_rt,   DFA, L)
+        tv_apos , node_outer_max_apos = compute_tv_from_tree(G_apos, DFA, L)
         tv_apos_corr = apply_delta_correction_apos(tv_apos, G_apos, DFA, L, sysAbs,
-                                                   delta_sys=delta_corr_scalars, T=t)
+                                                   delta_sys=delta_corr_scalars, T=t+1)
 
         mean_rt_curve.append(region_mean(tv_rt, r0, r1, c0, c1))
         mean_apos_corr_curve.append(region_mean(tv_apos_corr, r0, r1, c0, c1))
@@ -299,10 +301,14 @@ def main():
     import matplotlib.ticker as mticker
     fig, ax = plt.subplots(figsize=(12, 3))
 
+
+
     lbl_rt_mean        = r'$\textbf{Optimal Robust-tree Value functions}$  '
-    lbl_apos_corr_mean = r'$\textbf{Optimal A-posteriori corrected Value functions}$'
+    lbl_apos_corr_mean = r'$\textbf{Optimal A-posteriori corrected Value functions (discounted)}$'
+    lbl_mtl = r'$\textbf{Optimal A-posteriori corrected Value functions (M.T.L.)}$'
 
     ax.plot(Ts, mean_rt_curve,        label=lbl_rt_mean,        marker='s')
+    ax.plot(Ts, curve_mtl, label=lbl_mtl, marker='o')
     ax.plot(Ts, mean_apos_corr_curve, label=lbl_apos_corr_mean, marker='o')
 
     # Legend: bottom right, one column

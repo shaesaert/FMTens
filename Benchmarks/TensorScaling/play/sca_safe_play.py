@@ -3,9 +3,10 @@
 # -----------------------
 from importlib import reload
 
-from prompt_toolkit.contrib.telnet import TelnetServer
+# from prompt_toolkit.contrib.telnet import TelnetServer
 
 import src.models.linmodel as LinModel_mod
+
 reload(LinModel_mod)
 import src.models.mdpmodel as mdpmodel_mod
 reload(mdpmodel_mod)
@@ -27,23 +28,10 @@ from src.specifications.utils.dfa_tool import dfa_manipulation
 from src.abstraction.utils.labeling import dim_label
 from src.abstraction.utils.labeling import dim_label_eps
 from src.dynprog.dfa_tree_r1 import DFATree
+from src.dynprog.utils.treebasedV import compute_tv_from_tree
 from src.vis.dfa_tree_viz import plot_tree_layered
-from src.config.delta_ui import parse_delta_list  # parse single/CSV -> per-dim scalars
-
-# ---------- tiny I/O ----------
-def ask(prompt: str, default: str = "") -> str:
-    try:
-        s = input(prompt + " ").strip()
-    except EOFError:
-        s = ""
-    return s if s else default
-
-def ask_mode(prompt: str, default: str = "rt") -> str:
-    while True:
-        s = ask(f"{prompt} [rt/apos] (default {default}):", default).lower()
-        if s in {"rt", "apos"}:
-            return s
-        print("Please type 'rt' or 'apos'.")
+from src.vis.dfa_tree_viz import plot_tree_layered_heatnode
+import matplotlib.pyplot as plt
 
 def make_delta_vectors_from_scalars(scalars, sysAbs) -> list:
     """Create per-dimension vectors from scalars."""
@@ -55,7 +43,7 @@ def make_delta_vectors_from_scalars(scalars, sysAbs) -> list:
 # -----------------------
 # Continuous system (dim = optional dimensions, each 1D)
 # -----------------------
-dim = 6
+dim = 2
 
 # --- System ---
 # Initialize system dynamics containers
@@ -117,18 +105,12 @@ print(f"Safeset: {safeset}")
 print(f"Atomic propositions: {AP}")
 
 # --- DFA ---
+t_spec = 6
+formula = ''
 
-t_spec = 5
-
-# all time steps 0, 1, ..., t_spec
-if t_spec >= 0:
-    ks = range(t_spec + 1)
-else:
-    ks = [0]   # fallback, shouldn't really happen
-
-terms = [f"{'X' * k}({safeset})" for k in ks]
+ks = range(0, t_spec + 1)
+terms = [f"{'X' * k}({safeset})" for k in sorted(ks)]
 formula = " & ".join(terms)
-
 
 print(f"[D={dim}] LTL Formula (t_spec={t_spec}): {formula}")
 
@@ -151,7 +133,7 @@ DFA, letters = dfa_manipulation(
 # -----------------------
 sysAbs: dict[int, Optional[np.ndarray]] = {i: None for i in range(dim)}
 for i in range(dim):
-    sysAbs[i] = MDPModel.from_system(sysLTI[i], nx=100, nu=5, placement='centers', u_placement='endpoints',
+    sysAbs[i] = MDPModel.from_system(sysLTI[i], nx=10, nu=5, placement='centers', u_placement='endpoints',
                             tol=1e-19, contract_sum=None, compute_P = '1d')
 
 # -----------------------
@@ -194,78 +176,58 @@ rho = [np.full(nx[d], 1.0/nx[d], dtype=float) for d in range(len(dims))]
 nx_list = [sysAbs[k].N for k in sorted(sysAbs.keys())]
 L_list  = [L[k]       for k in sorted(sysAbs.keys())]
 
-# -----------------------
-# Configure delta
-# -----------------------
-# from src.config.delta_ui import interactive_delta
-# mode, delta_sys, delta_list_tree, apos, dims_sorted = interactive_delta(sysAbs, default=0.001)
 
 # -----------------------
 # Tree
 # -----------------------
 # 1) Initialization
+delta_VI_vecs = make_delta_vectors_from_scalars([0,0], sysAbs)
+delta_pol_vecs = make_delta_vectors_from_scalars([0,0], sysAbs)
 
-
-# -----------------------
-# Ask for modes and deltas
-# -----------------------
-VI_mode = ask_mode("Choose VI_mode", default="rt")   # 'rt' or 'apos'
-deltaVI_in = ask("Enter Δ_VI (single or CSV) [default 0.001] (If apos VI_mode, input 0):", "0.001")
-deltaVI_scalars = parse_delta_list(deltaVI_in, len(dims), default=0.001)
-delta_VI_vecs = make_delta_vectors_from_scalars(deltaVI_scalars, sysAbs)
-
-pol_mode = ask_mode("Choose pol_mode", default="rt")  # 'rt' or 'apos'
-deltaPol_in = ask("Enter Δ_pol (single or CSV) [default 0.001]:", "0.001")
-deltaPol_scalars = parse_delta_list(deltaPol_in, len(dims), default=0.001)
-delta_pol_vecs = make_delta_vectors_from_scalars(deltaPol_scalars, sysAbs)
-
-# --- NEW: user-defined apos correction delta ---
-apos_corr_in = ask("Enter Δ for a-posteriori correction (apos_correction_delta) [default same as Δ_pol]:", "")
-if apos_corr_in.strip() == "":
-    apos_corr_scalars = deltaPol_scalars
-else:
-    apos_corr_scalars = parse_delta_list(apos_corr_in, len(dims), default=0.001)
-
-print(f"\nConfig:")
-print(f"  VI_mode={VI_mode}, Δ_VI scalars={deltaVI_scalars}")
-print(f"  pol_mode={pol_mode}, Δ_pol scalars={deltaPol_scalars}")
-print(f"  apos_correction_delta scalars={apos_corr_scalars}")
-
-# -----------------------
-# Tree
-# -----------------------
 G = DFATree(
     DFA, sysAbs, pol, nx_list, L_list,
     delta_VI=delta_VI_vecs,
     delta_pol=delta_pol_vecs,
-    pol_mode=pol_mode,
-    VI_mode=VI_mode,
+    pol_mode='rt',
+    VI_mode='rt',
 )
 G.initiate()
 
-# T = int(ask("Enter build depth T [default 20]:", "20"))
-prune_tol = float(ask("Enter prune tol [default 5e-3]:", "0.005"))
-T = t_spec-1
-
-tol_growth = 1e-8
-for it in range(1, T + 1):
-    G.set_iter(it)
-    print(f"\n=== Iteration {it} (VI_mode={VI_mode}, pol_mode={pol_mode}) ===")
-    G.maxpolicy(rho)              # uses pol_mode & delta_pol internally
-    G.update_tree()               # uses VI_mode & delta_VI internally
-    # G.prune(prune_tol, 'leafs')
+# 2) Grow tree
+for it in range(1, t_spec + 1):
+    print(f"\n=== Iteration {it} ===")
+    G.maxpolicy(rho)
+    G.update_tree()
+    G.prune(0.005,'leafs')
     G.grow()
+    plot_tree_layered(G)
 
+# -----------------------
+# Compute tv and optional APoS correction
+# -----------------------
+# G.maxpolicy(rho)              # uses pol_mode & delta_pol internally
+# G.update_tree()               # uses VI_mode & delta_VI internally
+# G.prune(0.005, 'leafs')
+# plot_tree_layered(G)
 
+tv, node_outer_max = compute_tv_from_tree(G, DFA, L, max_elements=50_000_000)
 
-# # 3) Compute lb(satProb) based on tree
-# from src.dynprog.utils.treebasedV import compute_tv_from_tree
-# tv = compute_tv_from_tree(G, DFA, L, max_elements=50_000_000)
-#
-# if apos == 1:
+plot_tree_layered_heatnode(G, DFA, node_outer_max=node_outer_max)
+
+# if pol_mode == 'apos':
 #     from src.dynprog.utils.v_apos import apply_delta_correction_apos
-#     tv = apply_delta_correction_apos(tv, G, DFA, L, sysAbs, delta_sys=delta_sys, T=T)
+#     tv = apply_delta_correction_apos(tv, G, DFA, L, sysAbs,
+#                                      delta_sys=apos_corr_scalars, T=T)
 
 
-exit = 1
+# -----------------------
+# visualize satProb
+# -----------------------
+
+plt.show()
+
+exit = 0
+
+
+
 

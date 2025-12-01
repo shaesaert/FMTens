@@ -53,8 +53,13 @@ class DFATree:
         self.dim = len(self.sysAbs)
         # pol[q][d] is (N, nu) dense or csr one-hot (or None -> uniform)
         self.pol = pol
+        self.depths: Dict[int, int] = {}
 
-
+        # store zeta per node for analysis, to be removed when done with analysis
+        self.zeta_node: Dict[int, float] = {}
+        # discount factor and per-node gamma^l_n (for analysis)
+        self.gamma: float = 0.99
+        self.gamma_pow_node: Dict[int, float] = {}
 
         # === deltas for VI and policy (NEW, replaces old self.delta) ===
         def _normalize_delta_like(name, inp):
@@ -121,9 +126,13 @@ class DFATree:
           Dl[depth][1] = nodes at this depth with q != DFA.F   (q0/non-final bucket)
         """
         Dl = []
+        self.depths = {}
+
         if 0 in self.tree:
             # depth for every node
             lengths = nx.single_source_shortest_path_length(self.tree, 0)
+            self.depths.update({int(n): int(d) for n, d in lengths.items()})
+
             if lengths:
                 maxd = max(lengths.values())
                 Dl = [[[], []] for _ in range(maxd + 1)]
@@ -186,21 +195,6 @@ class DFATree:
         if NU % N != 0:
             raise ValueError(f"P must be (N, N*nu); got {P_flat.shape}")
         return NU // N
-
-    def _as_dense_policy(self, q: int, d: int) -> np.ndarray:
-        """Return pol[q][d] as dense (N,nu). If None, uniform."""
-        N = self.nx[d]
-        nu = self._nu_of_dim(d)
-        P = self.pol[q][d]
-        if P is None:
-            return np.full((N, nu), 1.0 / nu, dtype=float)
-        if issparse(P):
-            arr = P.toarray()
-        else:
-            arr = np.asarray(P, dtype=float)
-        if arr.shape != (N, nu):
-            raise ValueError(f"policy shape incompatible: got {arr.shape}, need ({N},{nu})")
-        return arr
 
     # ---------- initialization ----------
     def initiate(self) -> "DFATree":
@@ -363,6 +357,8 @@ class DFATree:
             if n == 0:
                 continue
             self.update_node_value(n)
+
+
     #  Q_n_apos
 
     def Q_n_apos(self, n: int) -> List[np.ndarray]:
@@ -380,9 +376,13 @@ class DFATree:
 
         # ----- compute zeta = 1 + delta_bold * (iter - l_n - 1) -----
         # l_n := parent depth of node n
-        depths = nx.single_source_shortest_path_length(self.tree, 0)  # node -> depth
-        dep_n = int(depths.get(n, 0))
-        l_n = max(dep_n , 0)
+
+        # depths = nx.single_source_shortest_path_length(self.tree, 0)  # node -> depth
+        # dep_n = int(depths.get(n, 0))
+        # l_n = max(dep_n , 0)
+
+        dep_n = int(self.depths.get(n, 0))
+        l_n =max(dep_n,0)
 
         iter_idx = self.iter_idx
 
@@ -394,6 +394,13 @@ class DFATree:
         delta_bold = 1.0 - float(np.prod([1.0 - s for s in delta_scalars]))
 
         zeta = 1.0 + delta_bold * (iter_idx - l_n )
+
+        # store zeta for per node, can be removed when done with analysis
+        self.zeta_node[n] = float(zeta)
+
+        # store gamma ** l_n per node (using self.gamma)
+        gamma_pow = float(self.gamma ** l_n)
+        self.gamma_pow_node[n] = gamma_pow
 
 
         # ----- build Qv and scale by zeta -----
@@ -411,20 +418,20 @@ class DFATree:
                 nu = P_flat.shape[1] // N
                 prod = np.asfortranarray(w) @ P_flat  # (1, N*nu)
                 Qv_d = np.reshape(prod, (N, nu), order='F')
-                Qv_d *= zeta
+                # Qv_d *= zeta
                 Qv.append(Qv_d)
 
             elif self.sysAbs[0].dim == 2:
                 nu = P_attr.a
                 prod = np.asfortranarray(w) @ P_attr.stoch
                 Qv_d = np.reshape(prod, (N, nu), order='F')
-                Qv_d *= zeta
+                # Qv_d *= zeta
                 Qv.append(Qv_d)
 
             else:
                 raise ValueError(f"{self.sysAbs[0].dim}>2 is not supported.")
 
-        return Qv
+        return Qv, zeta, l_n
 
     # ---------- Q-values for policy improvement ----------
     def Q_n(self, n: int) -> List[np.ndarray]:
@@ -483,120 +490,36 @@ class DFATree:
     def set_iter(self, i: int) -> None:
         self.iter_idx = int(i)
     # ---------- policy improvement ----------
+
+    # ---- maxpolicy -----
     def maxpolicy(self, rho):
         """
-        Dispatch to method-specific maxpolicy versions depending on the policy mode.
-        pol_mode:
-          'rt'   -> robusttree
-          'apos' -> aposteriori
+        Greedy policy improvement with two modes controlled by self.pol_mode:
+
+          pol_mode == "rt":
+              - robust-tree style
+              - uses Q_n(n), then subtracts delta_pol[d] before aggregation
+
+          pol_mode == "apos":
+              - a-posteriori style
+              - uses Q_n(n) only to compute c[d],
+                and Q_n_apos(n) (with zeta) for the contributions
+
+        In both cases:
+          - c[d] is computed with a UNIFORM policy (or previous policy if available)
+          - greedy argmax per (q,d) is used to update self.Pxx[q][d]
         """
+        import numpy as np
+        import scipy.sparse as sparse
+        from scipy.sparse import issparse
+
         mode = self.pol_mode
         print(f"[maxpolicy] Using policy mode: {mode}")
-        if mode == "apos":
-            return self._maxpolicy_aposteriori(rho)
-        elif mode == "rt":
-            return self._maxpolicy_robusttree(rho)
-        else:
+        if mode not in {"rt", "apos"}:
             raise RuntimeError(f"Unknown pol_mode: {mode}")
 
-    def _maxpolicy_aposteriori(self, rho):
-        """
-        Stateless greedy improvement (original logic):
-          - uses UNIFORM policy to compute c[d]
-          - computes greedy actions per (q,d)
-          - updates ONLY self.Pxx[q][d] in-place
-        """
-        import numpy as np
-        import scipy.sparse as sparse
-        import networkx as nx
-
         num_states = len(self.DFA.S)
-        pol = np.empty((num_states, self.dim), dtype=object)
-
-        # states to skip (final/sink)
-        skip = {int(self.DFA.F)}
-        if hasattr(self.DFA, "sink") and getattr(self.DFA, "sink") is not None:
-            skip.add(int(self.DFA.sink))
-
-        depths = nx.single_source_shortest_path_length(self.tree, 0)
-
-        delta_scalars = []
-        for d in range(self.dim):
-            deltad = np.asarray(self.delta_pol[d], dtype=float).ravel()
-            delta_scalars.append(float(deltad.max() if deltad.size else 0.0))
-        delta_bold = 1.0 - float(np.prod([1.0 - s for s in delta_scalars]))
-
-        # helper: dense uniform policy for a dimension d
-        def uniform_pol_dense(d: int) -> np.ndarray:
-            N = self.nx[d]
-            nu = self._nu_of_dim(d)
-            return np.full((N, nu), 1.0 / nu, dtype=float)
-
-        for q in set(self.DFA.S) - skip:
-            # If there's no Q for this state, refresh cache with uniform policy and continue
-            if not self.Q[q]:
-                for d in range(self.dim):
-                    P_src = self.sysAbs[d].P_flat if self.sysAbs[d].P_flat is not None else self.sysAbs[d].P
-                    self.Pxx[q][d] = Pc(P_src, uniform_pol_dense(d))
-                continue
-
-            # accumulate per-dimension scores
-            Vxa = [np.zeros((self.nx[d], self._nu_of_dim(d)), dtype=float)
-                   for d in range(self.dim)]
-
-
-            # iterate over all n in Q[q]
-            for n in self.Q[q]:
-                Qv = self.Q_n(n)  # list of arrays, each (N_d, nu_d)
-                Qv_apos = self.Q_n_apos(n)
-
-                # constants c[d] using UNIFORM policy
-                c = np.zeros(self.dim, dtype=float)
-                for d in range(self.dim):
-                    pol_dense = uniform_pol_dense(d)  # (N_d, nu_d)
-                    vec = np.sum(Qv[d] * pol_dense, axis=1)  # (N_d,)
-                    c[d] = float(np.asarray(rho[d]).ravel() @ vec)  # scalar
-
-                # scale[d] = prod(c) / c[d] (handle zeros safely)
-                prod_c = float(np.prod(c)) if self.dim > 0 else 1.0
-                scale = np.divide(prod_c, c, out=np.zeros_like(c), where=(c != 0))
-
-                # accumulate contribution to Vxa[d]
-                for d in range(self.dim):
-                    contrib = np.nan_to_num(
-                        Qv_apos[d] * scale[d],
-                        nan=0.0, posinf=0.0, neginf=0.0
-                    )  # (N_d, nu_d)
-                    Vxa[d] += contrib
-
-            # greedy argmax per dimension -> update ONLY Pxx
-            for d in range(self.dim):
-                I = np.argmax(Vxa[d], axis=1)  # choose best action per state row
-                rows = np.arange(Vxa[d].shape[0])
-                pol[q][d] = sparse.csr_matrix(
-                    (np.ones_like(rows, dtype=float), (rows, I)),
-                    shape=Vxa[d].shape
-                )
-                P_src = self.sysAbs[d].P_flat if self.sysAbs[d].P_flat is not None else self.sysAbs[d].P
-                self.Pxx[q][d] = Pc(P_src, pol[q][d])
-
-        self._last_greedy_pol = pol  # for debug
-        return self.Pxx
-
-
-
-    def _maxpolicy_robusttree(self, rho):
-        """
-        Stateless greedy improvement (original logic):
-          - uses UNIFORM policy to compute c[d]
-          - computes greedy actions per (q,d)
-          - updates ONLY self.Pxx[q][d] in-place
-        """
-        import numpy as np
-        import scipy.sparse as sparse
-
-        num_states = len(self.DFA.S)
-        pol = np.empty((num_states, self.dim), dtype=object)
+        new_pol = np.empty((num_states, self.dim), dtype=object)
 
         # states to skip (final/sink)
         skip = {int(self.DFA.F)}
@@ -609,58 +532,110 @@ class DFATree:
             nu = self._nu_of_dim(d)
             return np.full((N, nu), 1.0 / nu, dtype=float)
 
+        # ---------- main loop over DFA states ----------
         for q in set(self.DFA.S) - skip:
-            # If there's no Q for this state, refresh cache with uniform policy and continue
-            if not self.Q[q]:
+            q_int = int(q)
+
+            # If there's no tree nodes for this DFA state, keep previous policy (or uniform)
+            if not self.Q[q_int]:
                 for d in range(self.dim):
-                    P_src = self.sysAbs[d].P_flat if self.sysAbs[d].P_flat is not None else self.sysAbs[d].P
-                    self.Pxx[q][d] = Pc(P_src, uniform_pol_dense(d))
+                    prev_pol = None
+                    if self.pol is not None:
+                        prev_pol = self.pol[q_int][d]
+
+                    if prev_pol is None:
+                        prev_pol = uniform_pol_dense(d)
+
+                    new_pol[q_int][d] = prev_pol
+                    # keep Pxx consistent with that carried-over policy
+                    self.Pxx[q_int][d] = Pc(self.sysAbs[d].P_flat, prev_pol)
                 continue
 
             # accumulate per-dimension scores
             Vxa = [np.zeros((self.nx[d], self._nu_of_dim(d)), dtype=float)
                    for d in range(self.dim)]
 
-            # iterate over all n in Q[q]
-            for n in self.Q[q]:
+            # ---------- iterate over all tree nodes n with DFA state q ----------
+            for n in self.Q[q_int]:
+                # base Q (used for computing c[d] in both modes)
                 Qv = self.Q_n(n)  # list of arrays, each (N_d, nu_d)
 
-                # --- robust pre-subtraction using delta_pol (NEW) ---
-                for d in range(self.dim):
-                    Qv[d] = np.maximum(Qv[d] - self.delta_pol[d][:, None], 0.0)
+                if mode == "rt":
+                    # --- robust pre-subtraction using delta_pol ---
+                    for d in range(self.dim):
+                        Qv[d] = np.maximum(Qv[d] - self.delta_pol[d][:, None], 0.0)
 
-                # constants c[d] using UNIFORM policy
+                # constants c[d] using (previous) policy or uniform
                 c = np.zeros(self.dim, dtype=float)
+
                 for d in range(self.dim):
-                    pol_dense = uniform_pol_dense(d)  # (N_d, nu_d)
+                    pol_mat = None
+                    if self.pol is not None:
+                        pol_mat = self.pol[q_int][d]
+
+                    # turn policy into dense (N_d, nu_d)
+                    if pol_mat is None:
+                        pol_dense = uniform_pol_dense(d)
+                    elif issparse(pol_mat):
+                        pol_dense = pol_mat.toarray()
+                    else:
+                        pol_dense = np.asarray(pol_mat, dtype=float)
+
+                    # elementwise weighting of Q
                     vec = np.sum(Qv[d] * pol_dense, axis=1)  # (N_d,)
                     c[d] = float(np.asarray(rho[d]).ravel() @ vec)  # scalar
 
                 # scale[d] = prod(c) / c[d] (handle zeros safely)
                 prod_c = float(np.prod(c)) if self.dim > 0 else 1.0
-                scale = np.divide(prod_c, c, out=np.zeros_like(c), where=(c != 0))
+                scale = np.divide(prod_c, c,
+                                  out=np.zeros_like(c),
+                                  where=(c != 0))
+
+                # choose which Q to use for the contributions
+                if mode == "apos":
+                    # a-posteriori: use Q_n_apos (already includes zeta)
+                    Q_eff, zeta, l_n = self.Q_n_apos(n)
+                else:
+                    # robust-tree: use the robust-subtracted Qv
+                    Q_eff = Qv
+
 
                 # accumulate contribution to Vxa[d]
                 for d in range(self.dim):
-                    contrib = np.nan_to_num(
-                        Qv[d] * scale[d],
-                        nan=0.0, posinf=0.0, neginf=0.0
-                    )  # (N_d, nu_d)
-                    Vxa[d] += contrib
+                    contrib = Q_eff[d] * scale[d]
+                    # make absolutely sure both sides are arrays
+                    contrib = np.asarray(contrib, dtype=float)
+                    if mode == "apos":
+                        Vxa[d] = Vxa[d] + contrib * zeta
+                        # Vxa[d] = Vxa[d] + contrib * (self.gamma ** l_n)
+                    else:
+                        Vxa[d] = Vxa[d] + contrib
 
-            # greedy argmax per dimension -> update ONLY Pxx
+
+
+            # ---------- greedy argmax per dimension -> update ONLY Pxx ----------
             for d in range(self.dim):
-                I = np.argmax(Vxa[d], axis=1)  # choose best action per state row
+                I = np.argmax(Vxa[d], axis=1)  # best action per abstract state
                 rows = np.arange(Vxa[d].shape[0])
-                pol[q][d] = sparse.csr_matrix(
+                pol_d = sparse.csr_matrix(
                     (np.ones_like(rows, dtype=float), (rows, I)),
                     shape=Vxa[d].shape
                 )
-                P_src = self.sysAbs[d].P_flat if self.sysAbs[d].P_flat is not None else self.sysAbs[d].P
-                self.Pxx[q][d] = Pc(P_src, pol[q][d])
+                new_pol[q_int][d] = pol_d
+                self.Pxx[q_int][d] = Pc(self.sysAbs[d].P_flat, pol_d)
 
-        self._last_greedy_pol = pol # for debug
+        # ---------- keep policies for final / sink states ----------
+        for q in skip:
+            q_int = int(q)
+            if q_int < num_states:
+                for d in range(self.dim):
+                    if self.pol is not None:
+                        new_pol[q_int][d] = self.pol[q_int][d]
+                    # Pxx[q_int][d] is irrelevant for final/sink, but keep existing value
+
+        self.pol = new_pol
         return self.Pxx
+
 
     # ---------- pruning / relabeling ----------
     def findSubtree(self, n: int, nodeIDs: Optional[List[int]] = None) -> List[int]:
@@ -723,6 +698,116 @@ class DFATree:
 
         print(f"Pruning nodeids = {nodeids}")
         self.removeBranch(nodeids)
+
+    def prune2(self, threshold: float) -> None:
+        """
+        Prune nodes based on a per-node score defined as:
+
+            score(n) = min_d max_x V[d][n, x]
+
+        i.e. for each node n:
+          - first compute max over states for each dimension d,
+          - then take the MIN over dimensions.
+
+        Any non-root node (n != 0) with score(n) < threshold is removed.
+
+        If a removed node n has a parent p and children c, each child c is
+        reattached to p (grandparent reattachment). Root 0 is kept.
+
+        After pruning, node ids are relabelled to 0..N-1 and V, Q, leafs, Dl
+        are kept consistent.
+        """
+        n_nodes = self.tree.number_of_nodes()
+        if n_nodes == 0:
+            return
+
+        # --- 1) compute score(n) = min_d max_x V[d][n, x] ---
+        # we assume node ids are 0..n_nodes-1 and align with rows of V[d]
+        # initialize with +inf so that min over dims works
+        node_score = np.full(n_nodes, np.inf, dtype=float)
+
+        for d in range(self.dim):
+            Vd = np.asarray(self.V[d], dtype=float)
+            nrows = min(Vd.shape[0], n_nodes)
+            if nrows == 0:
+                continue
+            # max over abstract states for each node, dimension d
+            md = np.max(Vd[:nrows, :], axis=1)  # shape (nrows,)
+            # accumulate min over dimensions
+            node_score[:nrows] = np.minimum(node_score[:nrows], md)
+
+        # --- 2) choose nodes to remove (ALL non-root nodes) ---
+        # keep root (0) to preserve the accepting-mode invariant
+        to_remove = [n for n in range(1, n_nodes) if node_score[n] < threshold]
+        if not to_remove:
+            print(f"[prune2] No nodes below threshold {threshold:.3e}")
+            return
+
+        print(f"[prune2] threshold={threshold:.3e}, removing nodes {to_remove}")
+        to_remove_set = set(to_remove)
+
+        # --- 3) reattach children of nodes to be removed ---
+        for n in sorted(to_remove):
+            if n not in self.tree:
+                continue
+
+            parents = list(self.tree.predecessors(n))
+            parent = parents[0] if parents else None
+
+            # children and their edge labels BEFORE mutating the graph
+            children = list(self.tree.successors(n))
+            child_labels = {
+                c: self.tree.edges[n, c].get("l", 0)
+                for c in children
+                if self.tree.has_edge(n, c)
+            }
+
+            # if parent survives, reattach children to that parent
+            if parent is not None and parent not in to_remove_set:
+                for c in children:
+                    l = child_labels.get(c, 0)
+                    self.tree.add_edge(parent, c, l=l)
+            # if parent is None or also removed, children will either
+            # be removed later or end up as roots if they survive
+
+            # finally remove node n
+            self.tree.remove_node(n)
+
+        # --- 4) relabel remaining nodes to 0..N-1 ---
+        remaining = sorted(self.tree.nodes)
+        mapping = {old: new for new, old in enumerate(remaining)}
+        nx.relabel_nodes(self.tree, mapping, copy=False)
+
+        # --- 5) update leafs and Q with new ids ---
+        self.leafs = [mapping[n] for n in self.leafs if n in mapping]
+
+        new_Q = {int(q): [] for q in self.DFA.S}
+        for q, lst in self.Q.items():
+            new_Q[q] = [mapping[n] for n in lst if n in mapping]
+        self.Q = new_Q
+
+        # --- NEW: remap zeta_node if present , can be removed after done with zeta analysis---
+        if hasattr(self, "zeta_node"):
+            new_zeta = {}
+            for old, new in mapping.items():
+                if old in self.zeta_node:
+                    new_zeta[new] = self.zeta_node[old]
+            self.zeta_node = new_zeta
+
+        # --- 6) rebuild V rows in new order ---
+        for d in range(self.dim):
+            old_V = np.asarray(self.V[d], dtype=float)
+            new_V = np.zeros((len(remaining), self.nx[d]), dtype=float)
+            for old in remaining:
+                new = mapping[old]
+                if old < old_V.shape[0]:
+                    new_V[new, :] = old_V[old, :]
+            self.V[d] = new_V
+
+        # --- 7) recompute levels / depths ---
+        self._recompute_levels()
+
+        print(f"[prune2] Done. Remaining nodes: {len(self.tree.nodes)}")
 
     def removeBranch(self, nodes: List[int]) -> None:
         """

@@ -60,14 +60,14 @@ def apply_delta_correction_apos(tv, G, DFA, L, sysAbs, delta_sys, T, dims=None):
             raise ValueError(f"delta_sys length {len(delta_sys)} != #dims {D}")
         delta_scalars = [float(x) for x in delta_sys]
 
-    delta_vecs = [np.full(sysAbs[k].N, delta_scalars[i], dtype=float)
-                  for i, k in enumerate(keys)]
-    one_minus_delta_nd = _outer_nd([1.0 - dv for dv in delta_vecs])   # N-D
+    # delta_vecs = [np.full(sysAbs[k].N, delta_scalars[i], dtype=float)
+    #               for i, k in enumerate(keys)]
+    one_minus_delta_nd = _outer_nd([1.0 - dv for dv in delta_scalars])   # N-D
     delta_nd = 1.0 - one_minus_delta_nd                               # N-D
 
     # ----- per-destination-state deltas -----
     non_final_states = [int(q) for q in DFA.S if int(q) != F]
-    delta_nd_Q = {q: (delta_nd * mask_q[q]) for q in non_final_states}
+    # delta_nd_Q = {q: (delta_nd * mask_q[q]) for q in non_final_states}
 
     # ----- weighted vtens per state (must be N-D) -----
     # Expectation: this utility returns an N-D array per q with shape == tv_shape.
@@ -77,8 +77,11 @@ def apply_delta_correction_apos(tv, G, DFA, L, sysAbs, delta_sys, T, dims=None):
     # SumNodes_Q should be a dict: {q: N-D ndarray with shape tv_shape}
 
     # ----- assemble correction -----
+    # delta_correction = sum(
+    #     (-T * delta_nd_Q[q] + delta_nd_Q[q] * SumNodes_Q[q]) for q in non_final_states
+    # )
     delta_correction = sum(
-        (-T * delta_nd_Q[q] + delta_nd_Q[q] * SumNodes_Q[q]) for q in non_final_states
+        (-T * delta_nd + delta_nd * SumNodes_Q[q]) for q in non_final_states
     )
 
     # ----- clamp & return -----
