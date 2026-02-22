@@ -23,12 +23,20 @@ def _as_tree_and_dfa(
         return obj_or_tree.tree, (dfa or getattr(obj_or_tree, "DFA", None))
     raise TypeError("First arg must be a networkx.DiGraph or a DFATree-like object.")
 
+def _layered_positions(
+    G: nx.DiGraph,
+    root: int = 0,
+    xpad: float = 2.0,
+    ystep: float = 2.6,
+):
+    """Top-down layered layout with FIXED horizontal spacing xpad within each layer."""
+    from collections import defaultdict, deque
+    import numpy as np
 
-def _layered_positions(G: nx.DiGraph, root: int = 0, xpad: float = 2.0, ystep: float = 2.6):
-    """Simple top-down layered layout (BFS levels)."""
     depth = {root: 0}
     layers = defaultdict(list)
     q = deque([root])
+
     while q:
         u = q.popleft()
         d = depth[u]
@@ -39,17 +47,28 @@ def _layered_positions(G: nx.DiGraph, root: int = 0, xpad: float = 2.0, ystep: f
                 q.append(v)
 
     pos = {}
+
     for d in sorted(layers):
         nodes = layers[d]
         k = len(nodes)
-        xs = np.linspace(-(k - 1) * xpad / 2.0, (k - 1) * xpad / 2.0, k) if k > 1 else np.array([0.0])
+
+        # indices: 0,1,...,k-1  → shift to be centered around 0
+        # spacing is exactly xpad between neighbours
+        indices = np.arange(k)
+        xs = (indices - (k - 1) / 2.0) * xpad
+
         for x, n in zip(xs, nodes):
             pos[n] = (float(x), -d * ystep)
-    # catch any disconnected nodes
+
+    # any disconnected nodes go one layer lower in the middle
+    max_depth = max(layers) if layers else 0
     for n in G.nodes:
         if n not in pos:
-            pos[n] = (0.0, -(max(layers) + 1) * ystep)
+            pos[n] = (0.0, -(max_depth + 1) * ystep)
+
     return pos
+
+
 
 
 def _as_iter(v) -> list[int]:
@@ -90,8 +109,9 @@ def plot_tree_layered(
     root: int = 0,
     figsize: Tuple[float, float] = (12, 8),
     node_size: int = 2200,
-    node_color: str = "#DCE6FF",  # base color for "other" states
-    edge_color: str = "#334",
+
+    node_color: str = "#D8DEE8",
+    edge_color: str = "black",
     font_size: int = 11,
     letter_font_size: Optional[int] = None,
     use_letters: bool = True,
@@ -99,6 +119,8 @@ def plot_tree_layered(
     savepath: Optional[str] = None,
     xpad: float = 2.0,
     ystep: float = 2.6,
+    xlim: Optional[Tuple[float, float]] = None,
+    ylim: Optional[Tuple[float, float]] = None,
     seed: int = 0,  # kept for future randomness if needed
 ):
     """
@@ -155,9 +177,10 @@ def plot_tree_layered(
                     pass
         return False
 
-    # colors for DFA states
-    accept_color = "#8BC34A"  # green
-    init_color   = "#42A5F5"  # blue
+
+    accept_color = "#D8DEE8"  # green
+    init_color   = "#D8DEE8"  # blue
+
 
     node_labels = {}
     node_colors = []
@@ -167,13 +190,14 @@ def plot_tree_layered(
 
     for n in tree.nodes:
         q = tree.nodes[n].get("q", "?")
-        depth_val = _get_depth(n)
+        _ = _get_depth(n)  # still check depth exists, even if we don't display it
 
-        # label: "<id> | l=depth" or just "l=depth"
-        if show_ids:
-            node_labels[n] = f"{n} | l={depth_val}"
+        # --- label: root -> q_f, others -> q_0 ---
+        if n == root:
+            node_labels[n] = r"$q_f$"
         else:
-            node_labels[n] = f"l={depth_val}"
+            node_labels[n] = r"$q_0$"
+
 
         # color by DFA state
         if _is_accepting(DFA, q):
@@ -230,22 +254,32 @@ def plot_tree_layered(
         label_pos=0.5,
     )
 
-    # legend for colors
-    legend_handles = []
-    if has_accepting:
-        legend_handles.append(Patch(facecolor=accept_color, edgecolor=edge_color, label="F (accepting)"))
-    if has_initial:
-        legend_handles.append(Patch(facecolor=init_color, edgecolor=edge_color, label="S0 (initial)"))
-    if legend_handles:
-        ax.legend(handles=legend_handles, loc="upper right")
+
+    # compute default limits from current positions if not provided
+    xs, ys = zip(*pos.values())
+    if xlim is None:
+        pad_x = xpad
+        xlim = (min(xs) - pad_x, max(xs) + pad_x)
+    if ylim is None:
+        pad_y = ystep
+        ylim = (min(ys) - pad_y, max(ys) + pad_y)
+
+    ax.set_xlim(*xlim)
+    ax.set_ylim(*ylim)
+    ax.set_aspect("equal", adjustable="box")
 
     ax.set_axis_off()
-    ax.set_title("DFA Tree (layered)", fontsize=font_size + 1)
+
+    # transparent background
+    fig.patch.set_alpha(0)
+    ax.patch.set_alpha(0)
 
     if savepath:
-        fig.savefig(savepath, bbox_inches="tight", dpi=220)
-    plt.show()
+        fig.savefig(savepath, bbox_inches="tight", dpi=220, transparent=True)
+
+    plt.close(fig)
     return fig, ax
+
 
 
 def plot_tree_layered_heatnode(
@@ -257,7 +291,7 @@ def plot_tree_layered_heatnode(
     figsize: Tuple[float, float] = (12, 8),
     node_size: int = 2200,
     node_color: str = "#DCE6FF",  # unused base color, kept for signature compat
-    edge_color: str = "#334",
+    edge_color: str = "black",
     font_size: int = 11,
     letter_font_size: Optional[int] = None,
     use_letters: bool = True,

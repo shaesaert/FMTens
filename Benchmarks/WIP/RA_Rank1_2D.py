@@ -27,7 +27,6 @@ from src.abstraction.utils.labeling import dim_label_eps
 from src.performance.memory_check import print_workspace_memory
 from src.dynprog.dfa_tree_r1 import DFATree
 from src.vis.dfa_tree_viz import plot_tree_layered
-from src.vis.dfa_tree_viz import plot_tree_layered_heatnode
 from src.dynprog.utils.treebasedV import compute_tv_from_tree
 from src.vis.plot_tv import plotV_rank1
 from src.config.delta_ui import parse_delta_list  # parse single/CSV -> per-dim scalars
@@ -133,14 +132,15 @@ sysAbs = {
 # assume you already have:
 #   sysAbs, sysLTI, DFA, letters
 
-eps_val = 0.1  # robustness margin
+eps_val = 0.1 # this is your robustness margin
+
 L = dim_label_eps(
     sysAbs,
     sysLTI,
     letters,
     eps=eps_val,
-    visualize=False,
-    outdir=None,
+    visualize=False,   # or True if you want plots
+    outdir=None,       # or "some/folder" if visualize=True
     prefix="L_eps"
 )
 
@@ -164,13 +164,13 @@ L_list  = [L[k] for k in dims]
 # Ask for modes and deltas
 # -----------------------
 VI_mode = ask_mode("Choose VI_mode", default="rt")   # 'rt' or 'apos'
-deltaVI_in = ask("Enter Δ_VI (single or CSV) [default 0.001] (If apos VI_mode, input 0):", "0.001")
-deltaVI_scalars = parse_delta_list(deltaVI_in, len(dims), default=0.001)
+deltaVI_in = ask("Enter Δ_VI (single or CSV) [default 0.002] (If apos VI_mode, input 0):", "0.002")
+deltaVI_scalars = parse_delta_list(deltaVI_in, len(dims), default=0.002)
 delta_VI_vecs = make_delta_vectors_from_scalars(deltaVI_scalars, sysAbs)
 
 pol_mode = ask_mode("Choose pol_mode", default="rt")  # 'rt' or 'apos'
-deltaPol_in = ask("Enter Δ_pol (single or CSV) [default 0.001]:", "0.001")
-deltaPol_scalars = parse_delta_list(deltaPol_in, len(dims), default=0.001)
+deltaPol_in = ask("Enter Δ_pol (single or CSV) [default 0.002]:", "0.002")
+deltaPol_scalars = parse_delta_list(deltaPol_in, len(dims), default=0.002)
 delta_pol_vecs = make_delta_vectors_from_scalars(deltaPol_scalars, sysAbs)
 
 # --- NEW: user-defined apos correction delta ---
@@ -203,33 +203,47 @@ final_iter   = 0
 score_history = []
 idx_bounds = [(0, 798), (599, 699)]
 
-
 # T = int(ask("Enter build depth T [default 20]:", "20"))
 prune_tol = float(ask("Enter prune tol [default 5e-3]:", "0.005"))
 K_samp = 2000
-T = 1
-
+T =7
 tol_growth = 1e-8
 for it in range(1, T + 1):
-    G.set_iter(it)
     print(f"\n=== Iteration {it} (VI_mode={VI_mode}, pol_mode={pol_mode}) ===")
     G.maxpolicy(rho)              # uses pol_mode & delta_pol internally
     G.update_tree()               # uses VI_mode & delta_VI internally
     G.prune(prune_tol, 'leafs')
-    # G.prune2(prune_tol)
-    # plot_tree_layered(G)
     G.grow()
 
-plot_tree_layered(G)
+    score, gain, stop_now = G.progress_check(
+        idx_bounds=idx_bounds,
+        prev_score=prev_score,
+        K=K_samp,
+        tol_growth=tol_growth,
+        seed=fixed_seed,
+        it=it,
+    )
 
-tv, node_outer_max = compute_tv_from_tree(G, DFA, L, max_elements=50_000_000)
+    score_history.append(score)
+    final_iter = it
+    prev_score = score
 
-plot_tree_layered_heatnode(G, DFA, node_outer_max=node_outer_max)
+    if stop_now:
+        break
+
+
+    # Optional visualize:
+    plot_tree_layered(G)
+
+# -----------------------
+# Compute tv and optional APoS correction
+# -----------------------
+tv = compute_tv_from_tree(G, DFA, L, max_elements=50_000_000)
 
 if pol_mode == 'apos':
     from src.dynprog.utils.v_apos import apply_delta_correction_apos
     tv = apply_delta_correction_apos(tv, G, DFA, L, sysAbs,
-                                     delta_sys=apos_corr_scalars, T=it+1)
+                                     delta_sys=apos_corr_scalars, T=T)
 
 
 # -----------------------
@@ -266,6 +280,5 @@ style_axes_bold_labels_ticks()
 plt.show()
 
 exit = 0
-
 
 

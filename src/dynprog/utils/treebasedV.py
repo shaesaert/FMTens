@@ -119,3 +119,148 @@ def compute_tv_from_tree(G, DFA, L, *, max_elements=50_000_000, max_bytes=None):
         print("no probability at all lying in nodes:(none)")
 
     return tv, node_outer_max
+
+# compute interested_
+
+def _centers_from_sysAbs(sysAbs, Ns):
+    """
+    sysAbs[d].hx in your printout looks like [array([...])].
+    This returns centers[d] as a 1D array of length N_d.
+    """
+    D = len(Ns)
+    centers = []
+    for d in range(D):
+        hx = sysAbs[d].hx
+        if isinstance(hx, (list, tuple)):
+            # common: [array([...])]
+            if len(hx) == 1:
+                x = np.asarray(hx[0]).ravel()
+            else:
+                # pick the entry that matches N_d if possible
+                cand = [np.asarray(a).ravel() for a in hx]
+                x = next((c for c in cand if c.size == Ns[d]), cand[0])
+        else:
+            x = np.asarray(hx).ravel()
+        if x.size != Ns[d]:
+            raise ValueError(f"sysAbs[{d}].hx centers length {x.size} != N_{d}={Ns[d]}")
+        centers.append(x)
+    return centers
+
+def tv_interested_region_from_tree(
+    G, DFA, L, sysAbs, region, *,
+    inclusive=True,
+    max_elements=50_000_000,
+    max_bytes=None,
+    return_index_sets=True,
+    return_node_outer_max=True,
+    verbose=False
+):
+    """
+    Region-only TV with semantics:
+      - pick letter l for each composed state (via L)
+      - qdst = trans[q0,l]
+      - add sum_{n in G.Q[qdst]} prod_d G.V[d][n, idx_d]
+
+    Inputs:
+      - G.V[d]: (num_nodes, N_d)
+      - L[d]:   (n_letters, N_d)  (typically 0/1)
+      - sysAbs[d].hx: centers for dimension d (your case: [array([...])])
+      - region[d] = (low, high) in center coordinates
+    """
+    q0 = int(DFA.S0[0])
+    trans = np.asarray(DFA.trans, dtype=int)
+    n_letters = trans.shape[1]
+
+    D = len(G.V)
+    if len(region) != D:
+        raise ValueError(f"region must have length D={D}, got {len(region)}")
+    if len(sysAbs) < D:
+        raise ValueError(f"sysAbs must have at least D={D} entries")
+
+    Ns = [G.V[d].shape[1] for d in range(D)]
+    centers = _centers_from_sysAbs(sysAbs, Ns)
+
+    # --- indices inside region (center-point test) ---
+    idx_sets = []
+    for d in range(D):
+        lo, hi = region[d]
+        x = centers[d]
+        if inclusive:
+            idx = np.where((x >= lo) & (x <= hi))[0]
+        else:
+            idx = np.where((x > lo) & (x < hi))[0]
+        idx_sets.append(idx)
+
+    # empty region -> empty tv
+    if any(len(idx) == 0 for idx in idx_sets):
+        tv_empty = np.zeros(tuple(len(idx) for idx in idx_sets), dtype=float)
+        out = (tv_empty,)
+        if return_index_sets:
+            out += (idx_sets,)
+        if return_node_outer_max:
+            out += ({},)
+        return out if len(out) > 1 else out[0]
+
+    tv_shape = tuple(len(idx) for idx in idx_sets)
+
+    # --- memory guard ---
+    elem_size = np.dtype(float).itemsize
+    total_elems = int(np.prod(tv_shape, dtype=np.int64))
+    est_one = total_elems * elem_size
+
+    # cache node-sums for each qdst that can occur from q0 (only those with nodes matter)
+    qdsts = np.unique(trans[q0, :]).astype(int)
+    qdsts = [int(q) for q in qdsts if len(G.Q.get(int(q), [])) > 0]
+    K = len(qdsts)
+
+    est_work = est_one * (1 + K)  # tv + node_sum arrays
+    limit_bytes = int(max_bytes) if max_bytes is not None else int(max_elements * elem_size)
+
+    if est_one > limit_bytes or est_work > max(2 * limit_bytes, limit_bytes):
+        raise MemoryError(
+            "tv_interested_region_from_tree: region arrays too large to build safely.\n"
+            f"  region_shape={tv_shape} → {total_elems:,} elems\n"
+            f"  one array ≈ {_fmt_bytes(est_one)}; working set ≈ {_fmt_bytes(est_work)} (tv + {K} node_sum)\n"
+            f"  limit ≈ {_fmt_bytes(limit_bytes)}"
+        )
+
+    # --- precompute node_sum[q] over the region: sum_n outer(G.V at node n) ---
+    node_sum = {}
+    node_outer_max = {} if return_node_outer_max else None
+
+    for q in qdsts:
+        acc = np.zeros(tv_shape, dtype=float)
+        for n in G.Q.get(q, []):
+            node_vecs = [G.V[d][n, idx_sets[d]] for d in range(D)]
+            node_outer = _outer_nd(node_vecs)
+            acc += node_outer
+            if return_node_outer_max:
+                m = float(node_outer.max())
+                prev = node_outer_max.get(n, 0.0)
+                if m > prev:
+                    node_outer_max[n] = m
+        node_sum[q] = acc
+
+    # --- accumulate tv over letters, routing to destination qdst ---
+    tv = np.zeros(tv_shape, dtype=float)
+
+    for l in range(n_letters):
+        qdst = int(trans[q0, l])
+        acc = node_sum.get(qdst, None)
+        if acc is None:
+            continue  # no nodes for that destination => contributes nothing
+
+        label_vecs = [L[d][l, idx_sets[d]] for d in range(D)]
+        letter_mask = _outer_nd(label_vecs)  # (region tensor); typically 0/1
+        tv += letter_mask * acc
+
+    if verbose:
+        print(f"region idx sizes: {[len(i) for i in idx_sets]}")
+        print(f"cached qdsts with nodes: {sorted(node_sum.keys())}")
+
+    out = (tv,)
+    if return_index_sets:
+        out += (idx_sets,)
+    if return_node_outer_max:
+        out += (node_outer_max,)
+    return out if len(out) > 1 else out[0]

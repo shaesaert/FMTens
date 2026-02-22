@@ -606,8 +606,8 @@ class DFATree:
                     # make absolutely sure both sides are arrays
                     contrib = np.asarray(contrib, dtype=float)
                     if mode == "apos":
-                        Vxa[d] = Vxa[d] + contrib * zeta
-                        # Vxa[d] = Vxa[d] + contrib * (self.gamma ** l_n)
+                        # Vxa[d] = Vxa[d] + contrib * zeta
+                        Vxa[d] = Vxa[d] + contrib * (self.gamma ** l_n)
                     else:
                         Vxa[d] = Vxa[d] + contrib
 

@@ -502,7 +502,7 @@ def _intervals_from_polytope_1d(P, atol: float = 1e-12):
     return intervals_from_polytope_1d(P, atol=atol)
 
 
-def dim_label(sysAbs, sysLTI, letters, visualize: bool = False,
+def dim_label(sysAbs, sysLTI, letters, visualize: bool = True,
               outdir: Optional[str] = None, prefix: str = "L"):
     """
     Build per-dimension label matrices.
@@ -729,7 +729,7 @@ def label_axis_by_letters_robust(
 # ===============================================
 
 def dim_label_eps(sysAbs, sysLTI, letters, eps: Union[float, Dict[str, float]],
-                  visualize: bool=False, outdir: Optional[str]=None, prefix: str = "L_eps"):
+                  visualize: bool=True, outdir: Optional[str]=None, prefix: str = "L_eps"):
     """
     Build per-dimension robust label matrices L_eps:
       - positive AP -> shrink by eps_ap
