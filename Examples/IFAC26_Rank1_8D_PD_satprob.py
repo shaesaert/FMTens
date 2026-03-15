@@ -109,7 +109,7 @@
 
 from __future__ import annotations
 
-from config.PD_setup import (
+from config.IFAC26_8D_4robots_setup import (
     get_pd8d_config,
     apply_mpl_style,
     build_sysLTI_pd8d,
@@ -118,7 +118,7 @@ from config.PD_setup import (
 
 from src.pipeline import prepare_pipeline, run_tree
 
-from config.PD_8D_4robots_eval import (
+from config.IFAC26_8D_4robots_eval import (
     tv_value_at_point,
     scatter_point_sets_with_agent_colors,
 )

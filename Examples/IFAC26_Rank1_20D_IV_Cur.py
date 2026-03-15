@@ -34,7 +34,7 @@ def plot_results(cfg, results: list[SweepResult]):
                  label=rf'$\textbf{{Optimal APoS Value functions}} \ (N={N})$')
 
     ax1.legend(
-        prop={'size': 16, 'weight': 'bold'},
+        prop={'size': 19, 'weight': 'bold'},
         loc='upper right', bbox_to_anchor=(0.98, 0.98),
         bbox_transform=ax1.transAxes,
         ncol=1, frameon=True, framealpha=0.9,
@@ -43,6 +43,7 @@ def plot_results(cfg, results: list[SweepResult]):
     )
     ax1.xaxis.set_major_formatter(mticker.StrMethodFormatter(r'\textbf{{{x:g}}}'))
     ax1.yaxis.set_major_formatter(mticker.StrMethodFormatter(r'\textbf{{{x:g}}}'))
+    ax1.set_yticks([0.0, 0.25, 0.5, 0.75])
     ax1.xaxis.set_major_locator(mticker.MaxNLocator(integer=True))
     ax1.tick_params(axis="both", labelsize=18, length=8, width=2, pad=8)
     ax1.minorticks_off()
