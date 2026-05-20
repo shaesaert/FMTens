@@ -1,13 +1,7 @@
-from IPython.display import display
+
 import spot
-from spot.jupyter import display_inline
-from spot import buddy
-import subprocess
 import copy
 import networkx as nx
-import math
-from functools import partial
-from itertools import product
 
 # Job van der Werf authors half of this code.
 

@@ -16,8 +16,9 @@ class _Sys2D:
         self.U = U
         self.C = np.eye(2) if C is None else np.asarray(C, dtype=float)
 
+from src.abstraction.utils.abstraction_grid_helper import make_uniform_grid
 def _build_axes(bounds, counts):
-    axes, _ = MDPModel.make_uniform_grid(bounds, grid_counts=counts,
+    axes, _ = make_uniform_grid(bounds, grid_counts=counts,
                                          filter_inside=True, placement="centers")
     return [axes[0], axes[1]]
 
@@ -46,7 +47,8 @@ def test_pdet_columns_point_to_expected_cells(l):
     U_points = np.array([[0.0, 0.2],
                          [0.0, -0.1]], dtype=float)
 
-    tP_2d, hz, XhatSpace, beta, sys_ret, ZhatSpace, Uz = MDPModel.transition_matrix_nd_separable(
+    from src.abstraction.utils.abstraction_transition_builder import transition_matrix_nd_separable_impl
+    tP_2d, hz, XhatSpace, beta, sys_ret, ZhatSpace, Uz = transition_matrix_nd_separable_impl(
         sys=sys,
         X_axes=X_axes,
         U_points=U_points,

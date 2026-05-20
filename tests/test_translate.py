@@ -1,4 +1,4 @@
-from specifications.translate import *
+from src.specifications.translate import *
 import spot
 from unittest import TestCase
 

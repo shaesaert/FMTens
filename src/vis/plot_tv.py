@@ -1,42 +1,68 @@
+"""
+Heatmap visualisation of a 2D satisfaction tensor.
+
+Single function :func:`plotV_rank1`: renders ``tv`` (shape ``(Nx, Ny)``)
+as an ``imshow`` heatmap with axes labelled by the per-dimension state
+grids from ``sysAbs``. Matches the MATLAB ``imagesc`` orientation used
+in the SysCoRe reference.
+"""
+
 import numpy as np
 import matplotlib.pyplot as plt
 
+
 def plotV_rank1(sysAbs, tv, ax=None):
     """
-    Python equivalent of:
-      function plotV_rank1(sysAbs, tv)
-        X1hat = sysAbs{1}.states;
-        X2hat = sysAbs{2}.states;
-        imagesc(X1hat, X2hat, transpose(tv))
-        set(gca, 'Ydir', 'normal')
-        xlabel('x_1'); ylabel('x_2'); zlim([0, 1])
-      end
+    Plot a 2D satisfaction tensor as a heatmap.
 
-    Assumes:
-      - sysAbs is a dict keyed by dims (e.g., {0: ..., 1: ...})
-      - sysAbs[d].states is a 1D array of grid centers
-      - tv has shape (Nx, Ny), x-first (like MATLAB)
+    Python equivalent of the MATLAB function::
+
+        function plotV_rank1(sysAbs, tv)
+            X1hat = sysAbs{1}.states;
+            X2hat = sysAbs{2}.states;
+            imagesc(X1hat, X2hat, transpose(tv))
+            set(gca, 'Ydir', 'normal')
+            xlabel('x_1'); ylabel('x_2'); zlim([0, 1])
+        end
+
+    Parameters
+    ----------
+    sysAbs : dict
+        Per-dimension abstractions, keyed by integer dimension index.
+        Each ``sysAbs[d].states`` must be a 1D array of grid centres.
+        At least two keys are expected; the two smallest are taken as
+        the x and y axes.
+    tv : np.ndarray
+        Satisfaction tensor of shape ``(Nx, Ny)``, x-first (MATLAB
+        convention).
+    ax : matplotlib.axes.Axes, optional
+        Axes to plot into; a new ``(6, 5)`` figure is created if None.
+
+    Returns
+    -------
+    matplotlib.image.AxesImage
+        The image artist. Add a colorbar with
+        ``fig.colorbar(im, ax=ax)`` from the caller if desired.
     """
     keys = sorted(sysAbs.keys())
     X1hat = np.asarray(sysAbs[keys[0]].states).ravel()
     X2hat = np.asarray(sysAbs[keys[1]].states).ravel()
 
-    # axes extents from the state vectors (treat them as centers)
     x_min, x_max = float(X1hat.min()), float(X1hat.max())
     y_min, y_max = float(X2hat.min()), float(X2hat.max())
 
-    Z = np.asarray(tv, dtype=float).T  # transpose to match MATLAB imagesc orientation
+    # Transpose to match the MATLAB imagesc orientation.
+    Z = np.asarray(tv, dtype=float).T
 
     if ax is None:
-        fig, ax = plt.subplots(figsize=(6, 5))
+        _, ax = plt.subplots(figsize=(6, 5))
     im = ax.imshow(
         Z, origin="lower",
         extent=[x_min, x_max, y_min, y_max],
         aspect="auto",
-        cmap="viridis",  # 0→blue, 1→yellow
-        vmin=0.0, vmax=1.0
+        cmap="viridis",        # 0 -> blue, 1 -> yellow
+        vmin=0.0, vmax=1.0,
     )
-    # plt.colorbar(im, ax=ax)
     ax.set_xlabel(r"$x_1$")
     ax.set_ylabel(r"$x_2$")
     ax.set_title("tv heatmap")

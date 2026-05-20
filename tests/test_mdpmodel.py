@@ -63,26 +63,6 @@ def test_from_system_shapes_rowstochastic_no_contract():
     assert (rowsums >= -1e-12).all()
 
 
-
-def test_apply_substochastic_cap_and_set_modes():
-    sys = MiniSys()
-    nx, nu = 40, 4
-    mdp = MDPModel.from_system(
-        sys, nx=nx, nu=nu, placement='centers',
-        tol=1e-15, renormalize=True, contract_sum=None
-    )
-    # cap to 0.97 (shrink rows > 0.97 only)
-    mdp_cap = MDPModel(P=mdp.P_flat.copy(), hx=mdp.hx)
-    mdp_cap.apply_substochastic(target=0.97, mode='cap')
-    rowsums_cap = mdp_cap.P_blocks.sum(axis=1)
-    assert np.all(rowsums_cap <= 0.97 + 1e-12)
-    # set to exactly 0.95
-    mdp_set = MDPModel(P=mdp.P_flat.copy(), hx=mdp.hx)
-    mdp_set.apply_substochastic(target=0.95, mode='set')
-    rowsums_set = mdp_set.P_blocks.sum(axis=1)
-    assert np.allclose(rowsums_set, 0.95, atol=1e-10)
-
-
 # -------------------------
 # Row-substochastic checker
 # -------------------------

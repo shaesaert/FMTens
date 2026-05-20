@@ -1,43 +1,80 @@
+"""
+A-posteriori (APoS) delta correction for the satisfaction tensor.
+
+Applies an N-dimensional delta correction to an uncorrected satisfaction
+tensor ``tv`` produced by tree-based value iteration. The correction
+accounts for the abstraction error per dimension, propagated through the
+DFA tree over a horizon ``T``.
+
+The single public entry point is :func:`apply_delta_correction_apos`.
+
+Open question
+-------------
+The current correction does not mask ``delta_nd`` by per-destination-state
+reachability from ``q0`` (the ``mask_q`` tensor). An alternative form,
+which DOES apply that mask, is preserved in the comments and as a
+computed but unused tensor. It is currently unclear which form is
+correct; resolution requires a numerical comparison against published
+APoS results (e.g. paper Fig. 4 curves). See the comment block in
+:func:`apply_delta_correction_apos` for details.
+"""
+
 import numpy as np
 
-def _outer_nd(vectors):
-    """
-    N-ary outer product: given [v0, v1, ..., v_{D-1}] (1D arrays),
-    return an array with shape (len(v0), len(v1), ..., len(v_{D-1}))
-    whose entries are the product over all coordinates.
-    """
-    out = np.array(1.0, dtype=float)
-    for v in vectors:
-        out = np.multiply.outer(out, np.asarray(v, dtype=float))
-    return out
+from src.dynprog.utils.delta_corr_apos import (
+    _outer_nd,
+    weighted_vtens_sum_per_state,
+)
+
 
 def apply_delta_correction_apos(tv, G, DFA, L, sysAbs, delta_sys, T, dims=None):
     """
-    N-D a-posteriori delta correction (faithful N-D tensors).
+    N-D a-posteriori delta correction.
 
-    Inputs
-    ------
-    tv       : N-D ndarray, shape (N_0, N_1, ..., N_{D-1})
-               The uncorrected satisfaction tensor (already N-D).
-    G        : DFATree (with G.V[d] shape (num_nodes, N_d))
-    DFA, L   : standard DFA and per-dimension labeling (L[d] shape (n_letters, N_d))
-    sysAbs   : dict of abstractions, used to size delta vectors
-    delta_sys: list/tuple (aligned to sorted(sysAbs.keys())) OR dict {dim_key: scalar}
-               Per-dimension delta scalars (e.g., 0.01 per dim)
-    T        : int, horizon for the correction
-    dims     : optional iterable of dim keys (order). If None, sorted(sysAbs.keys()).
+    Parameters
+    ----------
+    tv : np.ndarray
+        Uncorrected satisfaction tensor of shape
+        ``(N_0, N_1, ..., N_{D-1})``.
+    G : DFATree
+        With ``G.V[d]`` of shape ``(num_nodes, N_d)``.
+    DFA : DFA object
+        Used for state list, accepting state, and transition table.
+    L : list of np.ndarray
+        Per-dimension labeling, ``L[d]`` of shape ``(n_letters, N_d)``.
+    sysAbs : dict
+        Per-dimension abstraction objects. Currently used only to obtain
+        the dimension keys when ``dims`` is None.
+    delta_sys : dict or sequence of float
+        Per-dimension delta scalars. If a dict, indexed by the same keys
+        as ``sysAbs``. If a sequence, aligned to the chosen ``dims`` /
+        ``sorted(sysAbs.keys())``.
+    T : int
+        Horizon for the correction.
+    dims : iterable, optional
+        Dimension keys (and their order). Defaults to
+        ``sorted(sysAbs.keys())``.
 
     Returns
     -------
-    tv_corr  : N-D ndarray (same shape as tv), clamped to [0, 1]
+    np.ndarray
+        Corrected satisfaction tensor, same shape as ``tv``,
+        clamped to ``[0, 1]``.
     """
-    # ----- dimension/order bookkeeping -----
+    # === Dimension/order bookkeeping ======================================
     keys = sorted(sysAbs.keys()) if dims is None else list(dims)
     D = len(keys)
     Ns = [G.V[k].shape[1] for k in keys]
     tv_shape = tuple(Ns)
 
-    # ----- build per-destination-state masks (full N-D) from q0 over letters -----
+    # === Per-destination-state reachability mask from q0 ==================
+    # mask_q[q] is the N-D tensor:
+    #     sum_{l : trans(q0, l) = q}  outer_d L[d][l, :]
+    # i.e. the membership of each abstract state in a letter that
+    # transitions q0 -> q.
+    #
+    # Currently this is computed but NOT used in the final correction
+    # (see the OPEN QUESTION block below).
     q0 = int(DFA.S0[0])
     F  = int(DFA.F)
     nQ = len(DFA.S)
@@ -47,43 +84,48 @@ def apply_delta_correction_apos(tv, G, DFA, L, sysAbs, delta_sys, T, dims=None):
     mask_q = [np.zeros(tv_shape, dtype=float) for _ in range(nQ)]
     for l in range(n_letters):
         qdst = int(trans[q0, l])
-        # N-D outer over label rows across all dims
         label_vecs = [L[k][l, :] for k in keys]
         mask_q[qdst] += _outer_nd(label_vecs)
 
-    # ----- N-D delta tensor: 1 - ⊗_d (1 - delta_d) -----
+    # === N-D delta tensor: 1 - prod_d (1 - delta_d) =======================
     if isinstance(delta_sys, dict):
         delta_scalars = [float(delta_sys[k]) for k in keys]
     else:
-        # assume iterable aligned with 'keys'
         if len(delta_sys) != D:
             raise ValueError(f"delta_sys length {len(delta_sys)} != #dims {D}")
         delta_scalars = [float(x) for x in delta_sys]
 
-    # delta_vecs = [np.full(sysAbs[k].N, delta_scalars[i], dtype=float)
-    #               for i, k in enumerate(keys)]
-    one_minus_delta_nd = _outer_nd([1.0 - dv for dv in delta_scalars])   # N-D
-    delta_nd = 1.0 - one_minus_delta_nd                               # N-D
+    one_minus_delta_nd = _outer_nd([1.0 - dv for dv in delta_scalars])
+    delta_nd = 1.0 - one_minus_delta_nd
 
-    # ----- per-destination-state deltas -----
+    # === Weighted vtens per state =========================================
     non_final_states = [int(q) for q in DFA.S if int(q) != F]
-    # delta_nd_Q = {q: (delta_nd * mask_q[q]) for q in non_final_states}
+    SumNodes_Q = weighted_vtens_sum_per_state(
+        G, T=T, non_final_states=non_final_states
+    )
+    # SumNodes_Q is a list of N-D ndarrays, length nQ, indexed by DFA state.
 
-    # ----- weighted vtens per state (must be N-D) -----
-    # Expectation: this utility returns an N-D array per q with shape == tv_shape.
-    # (If your current function is 2D, adapt it to produce N-D or write an N-D variant.)
-    from src.dynprog.utils.delta_corr_apos import weighted_vtens_sum_per_state
-    SumNodes_Q = weighted_vtens_sum_per_state(G, T=T, non_final_states=non_final_states)
-    # SumNodes_Q should be a dict: {q: N-D ndarray with shape tv_shape}
-
-    # ----- assemble correction -----
-    # delta_correction = sum(
-    #     (-T * delta_nd_Q[q] + delta_nd_Q[q] * SumNodes_Q[q]) for q in non_final_states
-    # )
+    # === Assemble correction ==============================================
+    #
+    # OPEN QUESTION (preserved from earlier iterations of this code):
+    # Two candidate corrections exist. The current implementation uses
+    # variant (A); variant (B), which masks the delta tensor by mask_q[q],
+    # is preserved here so it can be compared numerically against the
+    # paper's APoS results.
+    #
+    #   (A) unmasked  (currently active):
+    #       delta_correction = sum_{q non-final}
+    #           (-T * delta_nd + delta_nd * SumNodes_Q[q])
+    #
+    #   (B) masked    (currently inactive):
+    #       delta_nd_Q[q] = delta_nd * mask_q[q]
+    #       delta_correction = sum_{q non-final}
+    #           (-T * delta_nd_Q[q] + delta_nd_Q[q] * SumNodes_Q[q])
+    #
+    # To switch, replace the loop body below with the variant-(B) version.
     delta_correction = sum(
-        (-T * delta_nd + delta_nd * SumNodes_Q[q]) for q in non_final_states
+        (-T * delta_nd + delta_nd * SumNodes_Q[q])
+        for q in non_final_states
     )
 
-    # ----- clamp & return -----
     return np.clip(tv + delta_correction, 0.0, 1.0)
-

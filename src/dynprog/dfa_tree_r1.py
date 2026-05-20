@@ -1,12 +1,36 @@
-# dfa_tree_r1.py
-import copy
-from operator import index
-from typing import List, Dict, Any, Optional, Union
+"""
+DFATree — backward DFA-product tree for value iteration on multi-agent MDPs.
+
+This module defines :class:`DFATree`, the data structure that powers
+correct-by-design controller synthesis over the product of:
+
+    - a 0-based deterministic finite automaton (DFA) representing the
+      LTL specification, and
+    - one or more per-agent :class:`MDPModel` abstractions.
+
+The tree is rooted at the accepting DFA mode (node 0) and grown
+backwards through DFA predecessors (one ancestor per (state, letter)
+edge). Value iteration propagates from leaves to the root and
+supports two algorithm modes selected independently:
+
+    - ``VI_mode``: ``"rt"`` (robust, subtracts ``delta_VI`` and
+      clamps at 0) or ``"apos"`` (no subtraction during VI;
+      correction applied a-posteriori).
+    - ``pol_mode``: ``"rt"`` (robust policy improvement using
+      ``delta_pol``) or ``"apos"`` (a-posteriori weighting via
+      ``zeta`` and ``gamma^{l_n}``).
+
+Conventions:
+    - DFA.S must be ``[0, 1, ..., |S|-1]`` (consecutive, 0-based).
+    - Internal graph node ids are also 0-based, with root = 0.
+    - Edge label ``l`` on an edge ``(p -> c)`` is a 0-based column
+      index into the per-dimension labeling matrices ``L[d]``.
+"""
+from typing import List, Dict, Optional, Union
 
 import networkx as nx
 import numpy as np
-from fontTools.varLib.builder import VarData_CalculateNumShorts
-from scipy.sparse import csr_matrix, issparse
+from scipy.sparse import issparse
 from scipy import sparse
 from ..abstraction.utils.pc_utils import Pc
 
@@ -23,7 +47,7 @@ class DFATree:
       - children are added as 1, 2, ...
     """
 
-    # ---------- construction ----------
+    # === construction =====================================================
     def __init__(self, DFA, sysAbs, pol, nx_list, L,
                  delta_VI: Optional[Union[List[np.ndarray], tuple]] = None,
                  delta_pol: Optional[Union[List[np.ndarray], tuple]] = None,
@@ -61,7 +85,7 @@ class DFATree:
         self.gamma: float = 0.99
         self.gamma_pow_node: Dict[int, float] = {}
 
-        # === deltas for VI and policy (NEW, replaces old self.delta) ===
+        # === deltas for VI and policy ===
         def _normalize_delta_like(name, inp):
             if inp is None:
                 # default: zeros
@@ -79,7 +103,7 @@ class DFATree:
         self.delta_VI  = _normalize_delta_like("delta_VI",  delta_VI)
         self.delta_pol = _normalize_delta_like("delta_pol", delta_pol)
 
-        # === policy mode dispatch (NEW) ===
+        # === policy mode dispatch ===
         if pol_mode is None:
             self.pol_mode = "rt"   # default: robusttree-like policy improvement
         else:
@@ -88,7 +112,7 @@ class DFATree:
                 raise ValueError("pol_mode must be 'rt' or 'apos'")
             self.pol_mode = pm
 
-        # === VI mode dispatch (NEW) ===
+        # === VI mode dispatch ===
         if VI_mode is None:
             self.VI_mode = "rt"    # default: robust VI (subtract delta_VI)
         else:
@@ -118,7 +142,7 @@ class DFATree:
         self.Q: Dict[int, List[int]] = {int(q): [] for q in DFA.S}  # DFA state q -> list of node ids
         self.Dl: List[List[List[int]]] = []
 
-    # ---------- helpers ----------
+    # === helpers ==========================================================
     def _recompute_levels(self) -> None:
         """
         Build Dl as per-depth buckets, using G.Q for DFA labeling:
@@ -140,7 +164,7 @@ class DFATree:
                 F = int(self.DFA.F)
                 # sets for fast membership
                 qf_nodes = set(self.Q.get(F, []))
-                # everything else is “q0/non-final” bucket; you may refine if you track an explicit q0
+                # everything else is "q0/non-final" bucket; you may refine if you track an explicit q0
                 # collect all nodes across non-final states
                 non_final_nodes = set()
                 for q, nodes in self.Q.items():
@@ -154,7 +178,7 @@ class DFATree:
                     elif n in non_final_nodes:
                         Dl[d][1].append(int(n))
                     else:
-                        # Fallback: if a node isn’t in Q-mapping (shouldn’t happen), use its stored q
+                        # Fallback: if a node isn't in Q-mapping (shouldn't happen), use its stored q
                         q = self.Lq(n)
                         (Dl[d][0] if q == F else Dl[d][1]).append(int(n))
 
@@ -196,7 +220,7 @@ class DFATree:
             raise ValueError(f"P must be (N, N*nu); got {P_flat.shape}")
         return NU // N
 
-    # ---------- initialization ----------
+    # === initialization ===================================================
     def initiate(self) -> "DFATree":
         """
         Build the initial tree:
@@ -237,7 +261,7 @@ class DFATree:
 
         return self
 
-    # ---------- growth ----------
+    # === growth ===========================================================
     def grow(self, *args) -> None:
         """
         Expand all current leaves.
@@ -293,7 +317,7 @@ class DFATree:
         # Update levels Dl
         self._recompute_levels()
 
-    # ---------- dynamic programming ----------
+    # === dynamic programming =============================================
     def update_node_value(self, n: int) -> None:
         """
         One child->parent propagation step for node n (skip root).
@@ -341,7 +365,7 @@ class DFATree:
 
             # self.V[d][n, :] = vx.ravel()
 
-            # --- VI_mode branching (NEW) ---
+            # --- VI_mode branching ---
             if self.VI_mode == "rt":
                 # robust VI: subtract delta_VI, clamp at 0
                 self.V[d][n, :] = np.maximum(vx.ravel() - self.delta_VI[d], 0.0)
@@ -358,13 +382,13 @@ class DFATree:
                 continue
             self.update_node_value(n)
 
-
-    #  Q_n_apos
-
-    def Q_n_apos(self, n: int) -> List[np.ndarray]:
+    def Q_n_apos(self, n: int):
         """
-        Per-dimension arrays Qv[d] with shape (N_d, nu_d), multiplied by the
-        a-posteriori weight zeta before returning.
+        Per-dimension arrays Qv[d] with shape (N_d, nu_d).
+
+        Also computes the per-node weighting used by the a-posteriori
+        policy. See the remark in the body: gamma ** l_n is what drives the
+        policy; the zeta weighting is kept (commented out) for reference.
         """
         # parent and label
         parents = list(self.tree.predecessors(n))
@@ -374,33 +398,28 @@ class DFATree:
         nparent = parents[0]
         l = int(self.tree.edges[nparent, n]["l"])  # 0-based label
 
-        # ----- compute zeta = 1 + delta_bold * (iter - l_n - 1) -----
-        # l_n := parent depth of node n
-
-        # depths = nx.single_source_shortest_path_length(self.tree, 0)  # node -> depth
-        # dep_n = int(depths.get(n, 0))
-        # l_n = max(dep_n , 0)
-
+        # parent depth of node n
         dep_n = int(self.depths.get(n, 0))
-        l_n =max(dep_n,0)
+        l_n = max(dep_n, 0)
 
-        iter_idx = self.iter_idx
-
-        # delta_bold from self.delta_pol
-        delta_scalars = []
-        for dd in range(self.dim):
-            deltad = np.asarray(self.delta_pol[dd], dtype=float).ravel()
-            delta_scalars.append(float(deltad.max() if deltad.size else 0.0))
-        delta_bold = 1.0 - float(np.prod([1.0 - s for s in delta_scalars]))
-
-        zeta = 1.0 + delta_bold * (iter_idx - l_n )
-
-        # store zeta for per node, can be removed when done with analysis
-        self.zeta_node[n] = float(zeta)
-
-        # store gamma ** l_n per node (using self.gamma)
+        # === gamma weighting: gamma ** l_n  (this is what drives the policy) ===
         gamma_pow = float(self.gamma ** l_n)
         self.gamma_pow_node[n] = gamma_pow
+
+        # === zeta weighting: 1 + delta_bold * (iter_idx - l_n) ===
+        # REMARK: zeta and gamma ** l_n are mathematically different node
+        # weightings, but they were observed to give the same resulting
+        # policy here. maxpolicy uses gamma ** l_n; the zeta computation is
+        # kept below (commented out) for reference / analysis.
+        # iter_idx = self.iter_idx
+        # delta_scalars = []
+        # for dd in range(self.dim):
+        #     deltad = np.asarray(self.delta_pol[dd], dtype=float).ravel()
+        #     delta_scalars.append(float(deltad.max() if deltad.size else 0.0))
+        # delta_bold = 1.0 - float(np.prod([1.0 - s for s in delta_scalars]))
+        # zeta = 1.0 + delta_bold * (iter_idx - l_n)
+        # self.zeta_node[n] = float(zeta)
+        zeta = None  # not used in policy; see remark above
 
 
         # ----- build Qv and scale by zeta -----
@@ -433,7 +452,7 @@ class DFATree:
 
         return Qv, zeta, l_n
 
-    # ---------- Q-values for policy improvement ----------
+    # === Q-values for policy improvement =================================
     def Q_n(self, n: int) -> List[np.ndarray]:
         """
         Return per-dimension arrays Vxa[d] with shape (N, nu), where
@@ -489,9 +508,8 @@ class DFATree:
 
     def set_iter(self, i: int) -> None:
         self.iter_idx = int(i)
-    # ---------- policy improvement ----------
 
-    # ---- maxpolicy -----
+    # === policy improvement ==============================================
     def maxpolicy(self, rho):
         """
         Greedy policy improvement with two modes controlled by self.pol_mode:
@@ -509,10 +527,6 @@ class DFATree:
           - c[d] is computed with a UNIFORM policy (or previous policy if available)
           - greedy argmax per (q,d) is used to update self.Pxx[q][d]
         """
-        import numpy as np
-        import scipy.sparse as sparse
-        from scipy.sparse import issparse
-
         mode = self.pol_mode
         print(f"[maxpolicy] Using policy mode: {mode}")
         if mode not in {"rt", "apos"}:
@@ -532,7 +546,7 @@ class DFATree:
             nu = self._nu_of_dim(d)
             return np.full((N, nu), 1.0 / nu, dtype=float)
 
-        # ---------- main loop over DFA states ----------
+        # === main loop over DFA states ===
         for q in set(self.DFA.S) - skip:
             q_int = int(q)
 
@@ -555,7 +569,7 @@ class DFATree:
             Vxa = [np.zeros((self.nx[d], self._nu_of_dim(d)), dtype=float)
                    for d in range(self.dim)]
 
-            # ---------- iterate over all tree nodes n with DFA state q ----------
+            # === iterate over all tree nodes n with DFA state q ===
             for n in self.Q[q_int]:
                 # base Q (used for computing c[d] in both modes)
                 Qv = self.Q_n(n)  # list of arrays, each (N_d, nu_d)
@@ -613,7 +627,7 @@ class DFATree:
 
 
 
-            # ---------- greedy argmax per dimension -> update ONLY Pxx ----------
+            # === greedy argmax per dimension -> update ONLY Pxx ===
             for d in range(self.dim):
                 I = np.argmax(Vxa[d], axis=1)  # best action per abstract state
                 rows = np.arange(Vxa[d].shape[0])
@@ -624,7 +638,7 @@ class DFATree:
                 new_pol[q_int][d] = pol_d
                 self.Pxx[q_int][d] = Pc(self.sysAbs[d].P_flat, pol_d)
 
-        # ---------- keep policies for final / sink states ----------
+        # === keep policies for final / sink states ===
         for q in skip:
             q_int = int(q)
             if q_int < num_states:
@@ -637,7 +651,7 @@ class DFATree:
         return self.Pxx
 
 
-    # ---------- pruning / relabeling ----------
+    # === pruning / relabeling ============================================
     def findSubtree(self, n: int, nodeIDs: Optional[List[int]] = None) -> List[int]:
         """Collect all nodes in the subtree rooted at n (post-order)."""
         if nodeIDs is None:
@@ -699,115 +713,6 @@ class DFATree:
         print(f"Pruning nodeids = {nodeids}")
         self.removeBranch(nodeids)
 
-    def prune2(self, threshold: float) -> None:
-        """
-        Prune nodes based on a per-node score defined as:
-
-            score(n) = min_d max_x V[d][n, x]
-
-        i.e. for each node n:
-          - first compute max over states for each dimension d,
-          - then take the MIN over dimensions.
-
-        Any non-root node (n != 0) with score(n) < threshold is removed.
-
-        If a removed node n has a parent p and children c, each child c is
-        reattached to p (grandparent reattachment). Root 0 is kept.
-
-        After pruning, node ids are relabelled to 0..N-1 and V, Q, leafs, Dl
-        are kept consistent.
-        """
-        n_nodes = self.tree.number_of_nodes()
-        if n_nodes == 0:
-            return
-
-        # --- 1) compute score(n) = min_d max_x V[d][n, x] ---
-        # we assume node ids are 0..n_nodes-1 and align with rows of V[d]
-        # initialize with +inf so that min over dims works
-        node_score = np.full(n_nodes, np.inf, dtype=float)
-
-        for d in range(self.dim):
-            Vd = np.asarray(self.V[d], dtype=float)
-            nrows = min(Vd.shape[0], n_nodes)
-            if nrows == 0:
-                continue
-            # max over abstract states for each node, dimension d
-            md = np.max(Vd[:nrows, :], axis=1)  # shape (nrows,)
-            # accumulate min over dimensions
-            node_score[:nrows] = np.minimum(node_score[:nrows], md)
-
-        # --- 2) choose nodes to remove (ALL non-root nodes) ---
-        # keep root (0) to preserve the accepting-mode invariant
-        to_remove = [n for n in range(1, n_nodes) if node_score[n] < threshold]
-        if not to_remove:
-            print(f"[prune2] No nodes below threshold {threshold:.3e}")
-            return
-
-        print(f"[prune2] threshold={threshold:.3e}, removing nodes {to_remove}")
-        to_remove_set = set(to_remove)
-
-        # --- 3) reattach children of nodes to be removed ---
-        for n in sorted(to_remove):
-            if n not in self.tree:
-                continue
-
-            parents = list(self.tree.predecessors(n))
-            parent = parents[0] if parents else None
-
-            # children and their edge labels BEFORE mutating the graph
-            children = list(self.tree.successors(n))
-            child_labels = {
-                c: self.tree.edges[n, c].get("l", 0)
-                for c in children
-                if self.tree.has_edge(n, c)
-            }
-
-            # if parent survives, reattach children to that parent
-            if parent is not None and parent not in to_remove_set:
-                for c in children:
-                    l = child_labels.get(c, 0)
-                    self.tree.add_edge(parent, c, l=l)
-            # if parent is None or also removed, children will either
-            # be removed later or end up as roots if they survive
-
-            # finally remove node n
-            self.tree.remove_node(n)
-
-        # --- 4) relabel remaining nodes to 0..N-1 ---
-        remaining = sorted(self.tree.nodes)
-        mapping = {old: new for new, old in enumerate(remaining)}
-        nx.relabel_nodes(self.tree, mapping, copy=False)
-
-        # --- 5) update leafs and Q with new ids ---
-        self.leafs = [mapping[n] for n in self.leafs if n in mapping]
-
-        new_Q = {int(q): [] for q in self.DFA.S}
-        for q, lst in self.Q.items():
-            new_Q[q] = [mapping[n] for n in lst if n in mapping]
-        self.Q = new_Q
-
-        # --- NEW: remap zeta_node if present , can be removed after done with zeta analysis---
-        if hasattr(self, "zeta_node"):
-            new_zeta = {}
-            for old, new in mapping.items():
-                if old in self.zeta_node:
-                    new_zeta[new] = self.zeta_node[old]
-            self.zeta_node = new_zeta
-
-        # --- 6) rebuild V rows in new order ---
-        for d in range(self.dim):
-            old_V = np.asarray(self.V[d], dtype=float)
-            new_V = np.zeros((len(remaining), self.nx[d]), dtype=float)
-            for old in remaining:
-                new = mapping[old]
-                if old < old_V.shape[0]:
-                    new_V[new, :] = old_V[old, :]
-            self.V[d] = new_V
-
-        # --- 7) recompute levels / depths ---
-        self._recompute_levels()
-
-        print(f"[prune2] Done. Remaining nodes: {len(self.tree.nodes)}")
 
     def removeBranch(self, nodes: List[int]) -> None:
         """
@@ -853,7 +758,7 @@ class DFATree:
         # update levels Dl
         self._recompute_levels()
 
-    # -------- stopping criterion- region mean ------
+    # === stopping criterion: region mean =================================
     def approx_region_mean_sampling(
             self,
             idx_bounds,
@@ -901,8 +806,6 @@ class DFATree:
         float
             Estimated mean of value(x) over that region.
         """
-        import numpy as np
-
         rng = np.random.default_rng(seed)
 
         D = self.dim  # number of independent subsystems / dims
@@ -1031,7 +934,7 @@ class DFATree:
 
         return score, gain, False
 
-    # ---------- plotting ----------
+    # === plotting ========================================================
     def plot(self, use_letters: bool = False) -> None:
         import matplotlib.pyplot as plt
         pos = nx.spring_layout(self.tree, seed=0)
@@ -1047,7 +950,7 @@ class DFATree:
         plt.show()
 
 
-    # ---------- label helper ----------
+    # === label helper ====================================================
     @staticmethod
     def num2label(act: List[str], nodes_l: List[int]) -> List[str]:
         """Map label indices (0-based) to strings."""
