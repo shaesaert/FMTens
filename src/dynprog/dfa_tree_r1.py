@@ -441,7 +441,7 @@ class DFATree:
                 Qv.append(Qv_d)
 
             elif self.sysAbs[0].dim == 2:
-                nu = P_attr.a
+                nu = self._nu_of_dim(d)
                 prod = np.asfortranarray(w) @ P_attr.stoch
                 Qv_d = np.reshape(prod, (N, nu), order='F')
                 # Qv_d *= zeta
@@ -492,7 +492,7 @@ class DFATree:
                 Qv.append(Qv_d)
 
             elif self.sysAbs[0].dim == 2:
-                nu = P_attr.a
+                nu = self._nu_of_dim(d)
                 mask_row = np.asarray(self.L[d][l, :], dtype=float).reshape(1, -1)
                 v_parent_row = np.asarray(self.V[d][nparent, :], dtype=float).reshape(1, -1)
                 w = mask_row * v_parent_row
@@ -546,6 +546,14 @@ class DFATree:
             nu = self._nu_of_dim(d)
             return np.full((N, nu), 1.0 / nu, dtype=float)
 
+            # helper: choose the transition argument expected by Pc for dimension d.
+            #   1D agents pass the dense (N, N*nu) flat matrix on sysAbs[d].P_flat;
+            #   2D agents pass the TransitionProbability2D operator on sysAbs[d].P.
+        def _transition_arg(d: int):
+            return self.sysAbs[d].P_flat if self.sysAbs[d].dim == 1 else self.sysAbs[d].P
+
+            # === main loop over DFA states ===
+
         # === main loop over DFA states ===
         for q in set(self.DFA.S) - skip:
             q_int = int(q)
@@ -562,7 +570,7 @@ class DFATree:
 
                     new_pol[q_int][d] = prev_pol
                     # keep Pxx consistent with that carried-over policy
-                    self.Pxx[q_int][d] = Pc(self.sysAbs[d].P_flat, prev_pol)
+                    self.Pxx[q_int][d] = Pc(_transition_arg(d), prev_pol)
                 continue
 
             # accumulate per-dimension scores
@@ -636,7 +644,7 @@ class DFATree:
                     shape=Vxa[d].shape
                 )
                 new_pol[q_int][d] = pol_d
-                self.Pxx[q_int][d] = Pc(self.sysAbs[d].P_flat, pol_d)
+                self.Pxx[q_int][d] = Pc(_transition_arg(d), pol_d)
 
         # === keep policies for final / sink states ===
         for q in skip:

@@ -4,17 +4,26 @@ Per-dimension letter-mask construction (robust labeling under abstraction tolera
 
 Builds the 0/1 matrices `L[d]` indexed by (letter, abstract-state) that say
 which letters of the DFA alphabet are admissible at each abstract state of
-dimension d. Construction supports a robustness parameter `eps`: positive
-literals are evaluated against shrunken AP regions and negated literals
-against the complement of expanded regions, providing a correct-by-design
-tolerance for abstraction error.
+dimension d.
+
+Two construction paths, dispatched on the per-agent output dimensionality:
+
+    - 1D output  : evaluate per-axis interval membership with optional
+      robustness eps (shrink positives / expand negatives). This is the
+      historical path used by RA2D / RA4D where `C` projects to a single
+      position coordinate.
+    - n-D output : evaluate H-polytope membership `A x <= b` directly on
+      each abstract state. Used when `C = I_d` and labeling regions live
+      in the full d-dimensional output space (e.g. planar reach-avoid).
+      Robust labeling with eps > 0 is not currently implemented for the
+      multi-D path; eps > 0 emits a warning and falls back to exact
+      membership for those APs.
 
 Public API
 ----------
 - `dim_label(sysAbs, sysLTI, letters, eps=0.0, visualize=False, ...)`
     Per-dimension label matrices. With `eps=0.0`, exact membership; with
-    `eps>0`, the robust shrunk/expanded variant. The two old entry points
-    `dim_label` and `dim_label_eps` are unified here.
+    `eps>0` on a 1D output, the robust shrunk/expanded variant.
 - `intervals_from_polytope_1d(P)`
     1D H-polytope (or union) to a list of closed intervals.
 - `plot_binary_matrix(...)`
@@ -27,6 +36,7 @@ from __future__ import annotations
 
 import os
 import re
+import warnings
 from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
 import numpy as np
@@ -143,7 +153,7 @@ def intervals_from_polytope_1d(P, atol: float = 1e-12) -> List[Tuple[float, floa
 
 
 # ===========================================================================
-# Predicate builders (private)
+# Predicate builders (private) — 1D path
 # ===========================================================================
 def _ensure_eps_map(
     eps: Union[float, Mapping[str, float]], aps: Iterable[str]
@@ -207,7 +217,7 @@ def _make_pos_neg_predicates(
 
 
 # ===========================================================================
-# Per-axis mask builders (private)
+# Per-axis mask builders (private) — 1D path
 # ===========================================================================
 def _letter_mask_on_axis(
     xax: Iterable[float],
@@ -255,7 +265,7 @@ def _label_axis_by_letters(
     ap_regions: Dict[str, Iterable[Tuple[float, float]]],
     eps: Union[float, Mapping[str, float]],
 ) -> Array:
-    """Return a (n_letters × n_axis) 0/1 array."""
+    """Return a (n_letters × n_axis) 0/1 array, 1D path."""
     xax_arr = np.asarray(xax).ravel()
     lo_dom, hi_dom = float(xax_arr.min()), float(xax_arr.max())
     eps_map = _ensure_eps_map(eps, aps_in_dim)
@@ -267,18 +277,145 @@ def _label_axis_by_letters(
     return np.asarray(rows, dtype=int)
 
 
+# ===========================================================================
+# Multi-D path: direct H-polytope membership
+# ===========================================================================
+def _label_states_by_letters_nd(
+    states: Array,
+    letters: Sequence[str],
+    aps_in_dim: set,
+    ap_polys: Dict[str, "pc.Polytope"],   # noqa: F821 — forward type, never imported here
+    eps: Union[float, Mapping[str, float]],
+    atol: float = 1e-9,
+) -> Array:
+    """
+    Multi-dim labeling via direct H-polytope membership.
+
+    Parameters
+    ----------
+    states : (n_dim, N) ndarray
+        Each column is one abstract state in the agent's output space.
+    letters : sequence of str
+        DFA letters as Boolean expressions over atomic propositions.
+    aps_in_dim : set of str
+        APs this agent's labeling matrix actually enforces.
+    ap_polys : dict {ap -> polytope}
+        Raw polytope objects; membership tested via `poly.A @ x <= poly.b`.
+    eps : float or dict
+        Robustness margin. For eps > 0 on this multi-D path, exact
+        membership is used and a warning is emitted per AP — robust
+        labeling for general polytopes requires Minkowski sum/diff with
+        an eps-ball, which is not implemented here.
+    atol : float
+        Numerical tolerance on the per-constraint check.
+
+    Returns
+    -------
+    (n_letters, N) int array of 0/1 labels.
+    """
+    n_dim, N = states.shape
+    eps_map = _ensure_eps_map(eps, aps_in_dim)
+
+    # Precompute per-AP boolean membership across all N states (vectorised).
+    pos_mask: Dict[str, np.ndarray] = {}
+    for ap, poly in ap_polys.items():
+        if ap not in aps_in_dim:
+            continue
+        eps_ap = eps_map.get(ap, 0.0)
+        if eps_ap != 0.0:
+            warnings.warn(
+                f"dim_label: eps > 0 not implemented for multi-D labeling "
+                f"of AP {ap!r}; using exact membership.",
+                UserWarning,
+            )
+        A_poly = np.asarray(poly.A, dtype=float)        # (n_constraints, n_dim_poly)
+        b_poly = np.asarray(poly.b, dtype=float).ravel()  # (n_constraints,)
+        if A_poly.shape[1] != n_dim:
+            raise ValueError(
+                f"AP {ap!r}: polytope is {A_poly.shape[1]}-D but states are "
+                f"{n_dim}-D. Region and state dimensionality must match."
+            )
+        violation = A_poly @ states - b_poly.reshape(-1, 1)  # (n_constraints, N)
+        pos_mask[ap] = np.all(violation <= atol, axis=0)
+
+    rows: List[np.ndarray] = []
+    for letter in letters:
+        lits = [(ap, neg) for ap, neg in parse_literals(letter) if ap in aps_in_dim]
+
+        # in-dim contradiction
+        seen: Dict[str, bool] = {}
+        contradiction = False
+        for ap, neg in lits:
+            if ap in seen and seen[ap] != neg:
+                contradiction = True
+                break
+            seen[ap] = neg
+        if contradiction:
+            rows.append(np.zeros(N, dtype=int))
+            continue
+
+        if not lits:
+            rows.append(np.ones(N, dtype=int))
+            continue
+
+        ok = np.ones(N, dtype=bool)
+        for ap, neg in lits:
+            ok = ok & (~pos_mask[ap] if neg else pos_mask[ap])
+        rows.append(ok.astype(int))
+
+    return np.asarray(rows, dtype=int)
+
+
+# ===========================================================================
+# Output-axis extraction (shape-preserving)
+# ===========================================================================
+def _states_from_outputs(mdp) -> Array:
+    """
+    Return the per-agent abstract states as a `(n_dim, N)` array,
+    preserving the original output dimensionality. Used by both the 1D
+    and multi-D labeling paths.
+
+    Falls back to `mdp.hx` only when `mdp.outputs` is absent AND `hx` is
+    a single 1D axis; multi-D abstractions are required to populate
+    `outputs` (the abstraction factory does so automatically).
+    """
+    out = getattr(mdp, "outputs", None)
+    if out is not None:
+        arr = np.asarray(out, dtype=float)
+        if arr.ndim == 1:
+            return arr.reshape(1, -1)
+        if arr.ndim == 2:
+            return arr
+        raise ValueError(f"unexpected outputs shape {arr.shape}")
+
+    hx = getattr(mdp, "hx", None)
+    if hx is None:
+        raise ValueError("MDPModel has neither 'outputs' nor 'hx' available.")
+    if isinstance(hx, (list, tuple)):
+        if len(hx) != 1:
+            raise ValueError(
+                f"`hx` has {len(hx)} axes; multi-D labeling requires `outputs` "
+                f"to be populated by the abstraction factory."
+            )
+        return np.asarray(hx[0], dtype=float).reshape(1, -1)
+    return np.asarray(hx, dtype=float).reshape(1, -1)
+
+
+# Kept for backward compatibility with any external caller importing it.
 def _axis_from_outputs_or_hx(mdp) -> Array:
-    """Return the 1D axis from `mdp.outputs` (preferred) or `mdp.hx` (fallback)."""
-    axis = getattr(mdp, "outputs", None)
-    if axis is None:
-        axis = getattr(mdp, "hx", None)
-    if axis is None:
-        raise ValueError("MDPModel has neither 'outputs' nor 'hx' axis available.")
-    if isinstance(axis, (list, tuple)):
-        if len(axis) != 1:
-            raise ValueError(f"expected a single axis, got {len(axis)}")
-        return np.asarray(axis[0], dtype=float).ravel()
-    return np.asarray(axis, dtype=float).ravel()
+    """
+    Legacy 1D axis extractor. Prefer :func:`_states_from_outputs`, which
+    is shape-preserving. This wrapper still ravels and returns a 1D array
+    but raises if the output is genuinely multi-D, so the silent-doubling
+    bug for 2D outputs cannot happen.
+    """
+    states = _states_from_outputs(mdp)
+    if states.shape[0] != 1:
+        raise ValueError(
+            f"_axis_from_outputs_or_hx called on a {states.shape[0]}-D output; "
+            f"use _states_from_outputs instead."
+        )
+    return states[0, :]
 
 
 # ===========================================================================
@@ -346,25 +483,29 @@ def dim_label(
     """
     Build per-dimension letter-mask matrices `L[d]` for the given DFA letters.
 
-    Each `L[d]` has shape (len(letters), N_d), where N_d is the number of
-    abstract states in dimension d. Entry `L[d][l, n] = 1` iff letter `l`
-    is admissible at abstract state `n` in dimension `d`.
+    Each `L[d]` has shape `(len(letters), N_d)`, where `N_d` is the number of
+    abstract states in agent `d`. Entry `L[d][l, n] = 1` iff letter `l` is
+    admissible at abstract state `n` of agent `d`.
+
+    Dispatch:
+        - if agent `d`'s output is 1D: use the historical interval-based
+          path (supports robustness `eps > 0`).
+        - if agent `d`'s output is multi-D: use direct H-polytope
+          membership on each abstract state. `eps > 0` falls back to exact
+          membership with a warning.
 
     Parameters
     ----------
     sysAbs : dict[int, MDPModel] or list[MDPModel]
-        Per-dimension abstract MDPs.
+        Per-agent abstract MDPs.
     sysLTI : dict[int, LinModel] or list[LinModel]
-        Per-dimension continuous LTI systems (provides AP names and regions).
+        Per-agent continuous LTI systems (provides AP names and regions).
     letters : sequence of str
         DFA letters as Boolean expressions over atomic propositions.
     eps : float or dict[str, float], default 0.0
-        Robustness tolerance. With `eps=0`, exact membership is used. With
-        `eps>0`, positive literals are evaluated against shrunken AP regions
-        and negated literals against the complement of expanded regions.
-        A dict can specify a different eps per AP.
+        Robustness tolerance. See dispatch above for the multi-D caveat.
     visualize : bool, default False
-        If True, save a heatmap per dimension to `outdir`.
+        If True, save a heatmap per agent to `outdir`.
     outdir : str, optional
         Directory for the visualisation PNGs (created if missing).
     prefix : str, default "L"
@@ -373,8 +514,8 @@ def dim_label(
     Returns
     -------
     dict or list
-        Dict keyed by dimension if `sysAbs` is a dict; otherwise a list in
-        dimension order.
+        Dict keyed by agent if `sysAbs` is a dict; otherwise a list in
+        agent order.
     """
     if isinstance(sysAbs, dict):
         keys = sorted(sysAbs.keys())
@@ -392,23 +533,38 @@ def dim_label(
         mdp_k = sysAbs[k]
         lti_k = sysLTI[k]
 
-        xax_k = _axis_from_outputs_or_hx(mdp_k)
+        states_k = _states_from_outputs(mdp_k)   # (n_dim, N)
+        n_dim, N = states_k.shape
+
         aps = list(getattr(lti_k, "AP", []))
         regions = list(getattr(lti_k, "regions", []))
         aps_set = set(aps)
-        regions_map = {ap: intervals_from_polytope_1d(reg) for ap, reg in zip(aps, regions)}
 
-        Lk = _label_axis_by_letters(xax_k, letters, aps_set, regions_map, eps).astype(float)
+        if n_dim == 1:
+            xax_k = states_k[0, :]
+            regions_map = {
+                ap: intervals_from_polytope_1d(reg)
+                for ap, reg in zip(aps, regions)
+            }
+            Lk = _label_axis_by_letters(
+                xax_k, letters, aps_set, regions_map, eps,
+            ).astype(float)
+        else:
+            ap_polys = {ap: reg for ap, reg in zip(aps, regions)}
+            Lk = _label_states_by_letters_nd(
+                states_k, letters, aps_set, ap_polys, eps,
+            ).astype(float)
+
         L_map[k] = Lk
 
         if visualize:
             fname = f"{prefix}{k}.png"
             if outdir:
                 fname = os.path.join(outdir, fname)
-            step = max(1, len(xax_k) // 10)
+            step = max(1, N // 10)
             plot_binary_matrix(
                 Lk.astype(int),
-                title=f"{prefix}[{k}] (letters × x{k}-grid, eps={eps})",
+                title=f"{prefix}[{k}] (letters x state-grid, eps={eps}, dim={n_dim})",
                 row_labels=list(letters),
                 outfile=fname,
                 x_tick_step=step,

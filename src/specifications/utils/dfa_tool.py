@@ -666,3 +666,197 @@ def dfa_manipulation(
             f"|act|={len(letters)}  missing={miss}  letters={letters}"
         )
     return DFA, letters
+
+from typing import List, Optional, Dict, Any
+
+def check_letter_disjointness(
+    letters: List[str],
+    L_list: Optional[List[np.ndarray]] = None,
+    DFA = None,
+    verbose: bool = True,
+) -> Dict[str, Any]:
+    """
+    Verify DFA edge letters are pairwise non-overlapping per source state.
+
+    Two letters can only conflict if they are both active transitions out of
+    the same DFA state. With a DFA argument the check is scoped per source
+    state; without it, falls back to a global check (over-strict).
+
+    Two checks are run:
+
+    1. **Boolean check** (always): pair is *boolean-disjoint* iff some shared
+       atomic proposition has opposite polarity. A boolean overlap means a
+       literal assignment exists that satisfies both letters — abstraction
+       fragile (could trigger non-determinism on a different grid) even if
+       the current grid happens to dodge it.
+
+    2. **L-mask check** (when ``L_list`` is provided): pair has a joint
+       overlap iff every dimension has at least one cell where both per-dim
+       masks are simultaneously non-zero. This is the runtime-safety check
+       on the actual abstraction.
+
+    The ``clean`` verdict is based on the L-mask check when ``L_list`` is
+    given (runtime safety), otherwise on the boolean check (necessary but
+    strict). ``clean_boolean`` and ``clean_mask`` are exposed separately so
+    callers can opt into stricter behaviour.
+
+    Parameters
+    ----------
+    letters : list of str
+        DFA edge labels (output of ``dfa_manipulation``).
+    L_list : list of np.ndarray, optional
+        Per-dim labelling tensors of shape ``(num_letters, N_d)``.
+    DFA : object, optional
+        DFA exposing ``S`` (state list), ``trans`` (|S| × n_letters
+        destination array), and optionally ``sink``. When provided, only
+        pairs of letters that are simultaneously active from a common
+        source state are checked.
+    verbose : bool
+        Print a per-pair summary.
+
+    Returns
+    -------
+    dict with keys
+        'boolean_overlaps' : {q: [(i, j, witness), ...]}
+        'mask_overlaps'    : {q: [(i, j, joint_cell), ...]}    [if L_list given]
+        'clean'            : bool — True iff runtime-safe on current grid.
+        'clean_boolean'    : bool — True iff no structural (boolean) overlap.
+        'clean_mask'       : bool — True iff no L-mask overlap (or no L_list).
+    """
+    import warnings
+    from src.abstraction.utils.labeling import parse_literals
+
+    n = len(letters)
+    parsed = [dict(parse_literals(s)) for s in letters]
+
+    # --- group letters by source state ---
+    if DFA is None:
+        groups = {None: list(range(n))}
+    else:
+        trans = np.asarray(DFA.trans, dtype=int)
+        sink = getattr(DFA, "sink", None)
+        sink = int(sink) if sink is not None else None
+
+        groups = {}
+        for q in DFA.S:
+            q_int = int(q)
+            active = []
+            for l in range(n):
+                dst = int(trans[q_int, l])
+                if dst < 0:
+                    continue
+                if sink is not None and dst == sink:
+                    continue
+                active.append(l)
+            if len(active) >= 2:
+                groups[q_int] = active
+
+    # --- boolean check, per group ---
+    boolean_overlaps: Dict[Any, list] = {}
+    for q, group in groups.items():
+        local = []
+        for ii, i in enumerate(group):
+            for j in group[ii+1:]:
+                common = set(parsed[i]) & set(parsed[j])
+                has_contradiction = any(parsed[i][ap] != parsed[j][ap] for ap in common)
+                if not has_contradiction:
+                    witness = {**parsed[i], **parsed[j]}
+                    local.append((i, j, witness))
+        if local:
+            boolean_overlaps[q] = local
+
+    # --- L-mask check, per group ---
+    mask_overlaps: Dict[Any, list] = {}
+    if L_list is not None:
+        if L_list[0].shape[0] != n:
+            warnings.warn(
+                f"L_list has {L_list[0].shape[0]} rows but {n} letters; "
+                "skipping L-mask check."
+            )
+            L_list_for_check = None
+        else:
+            L_list_for_check = L_list
+            dim = len(L_list)
+            for q, group in groups.items():
+                local = []
+                for ii, i in enumerate(group):
+                    for j in group[ii+1:]:
+                        per_dim_witness = []
+                        fires_everywhere = True
+                        for d in range(dim):
+                            prod = L_list[d][i, :] * L_list[d][j, :]
+                            if not np.any(prod > 0):
+                                fires_everywhere = False
+                                break
+                            per_dim_witness.append(int(np.argmax(prod)))
+                        if fires_everywhere:
+                            local.append((i, j, tuple(per_dim_witness)))
+                if local:
+                    mask_overlaps[q] = local
+    else:
+        L_list_for_check = None
+
+    # --- verdicts ---
+    clean_boolean = (not boolean_overlaps)
+    clean_mask    = (L_list_for_check is None) or (not mask_overlaps)
+    # Runtime-safety verdict: L-mask when available (the algorithm-relevant
+    # check), otherwise fall back to boolean (the structural check).
+    clean = clean_mask if L_list_for_check is not None else clean_boolean
+
+    # --- reporting ---
+    if verbose:
+        n_pairs = sum(len(g) * (len(g) - 1) // 2 for g in groups.values())
+        scope = (f"across {len(groups)} source state(s)" if DFA is not None
+                 else "global (no DFA structure)")
+        print(f"[letter-disjointness] {n} letters, {n_pairs} pairs {scope}")
+
+        def _q_sort_key(kv):
+            return (-1 if kv[0] is None else kv[0])
+
+        # boolean
+        if not clean_boolean:
+            total = sum(len(v) for v in boolean_overlaps.values())
+            tag = "WARN" if clean_mask else "FAIL"
+            print(f"  boolean check: {tag} — {total} structural overlap(s)")
+            for q, lst in sorted(boolean_overlaps.items(), key=_q_sort_key):
+                if q is not None:
+                    print(f"  ── from DFA state q={q} ──")
+                for i, j, w in lst:
+                    w_str = ", ".join(f"{ap}={'F' if neg else 'T'}"
+                                      for ap, neg in sorted(w.items()))
+                    print(f"    [{i}]'{letters[i]}'  ∩  [{j}]'{letters[j]}'")
+                    print(f"        witness: {{{w_str}}}")
+        else:
+            print(f"  boolean check: OK")
+
+        # L-mask
+        if L_list_for_check is not None:
+            if not clean_mask:
+                total = sum(len(v) for v in mask_overlaps.values())
+                print(f"  L-mask check: FAIL — {total} grid overlap(s)")
+                for q, lst in sorted(mask_overlaps.items(), key=_q_sort_key):
+                    if q is not None:
+                        print(f"  ── from DFA state q={q} ──")
+                    for i, j, st in lst:
+                        print(f"    [{i}]'{letters[i]}'  ∩  [{j}]'{letters[j]}'")
+                        print(f"        joint cell: {st}")
+            else:
+                print(f"  L-mask check: OK")
+
+        # verdict
+        if clean:
+            if clean_boolean:
+                print(f"  → CLEAN ✓")
+            else:
+                print(f"  → CLEAN on current abstraction ✓  "
+                      f"(boolean overlaps remain — fragile to grid changes)")
+        else:
+            print(f"  → OVERLAPS DETECTED ✗")
+
+    return {
+        "boolean_overlaps": boolean_overlaps,
+        "mask_overlaps":    mask_overlaps,
+        "clean":            clean,
+        "clean_boolean":    clean_boolean,
+        "clean_mask":       clean_mask,
+    }

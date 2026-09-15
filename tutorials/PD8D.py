@@ -41,7 +41,7 @@ NX        = 1200      # abstract states per agent
 NU        = 10        # abstract inputs per agent
 EPS       = 0.1       # abstraction-labeling correction  (set 0 for discrete-state regime)
 T         = 20        # max tree-iteration depth
-PRUNE_TOL = 5e-3      # prune nodes whose value < PRUNE_TOL
+PRUNE_TOL = 5e-3    # prune nodes whose value < PRUNE_TOL
 
 MODE      = "apos"    # "rt" or "apos"   (will collapse to a single `mode` parameter later)
 DELTA     = 0.0004    # abstraction error in tree iteration
@@ -164,10 +164,11 @@ DFA, letters = dfa_manipulation(
         (2, 2, "p15"),
         (2, 2, "p16"),
         (2, 2, "p11 & p12 & p13 & p14 & !p7 & !p8 & !p9 & !p10"),
-        (2, 1, "p7  & p11"),
-        (2, 1, "p8  & p12"),
-        (2, 1, "p9  & p13"),
-        (2, 1, "p10 & p14"),
+        # (2, 1, "p7  & p11"),
+        # (2, 1, "p8  & p12"),
+        # (2, 1, "p9  & p13"),
+        # (2, 1, "p10 & p14"),
+        (2, 1, "p7 & p8 & p9 & p10 & p11 & p12 & p13 & p14"),
         (2, 0, "p1 & p3 & p4 & p5 & p6"),
     ],
     index_base          = 0,
@@ -195,6 +196,10 @@ sysAbs, L, L_list, pol, rho, nx_list = prepare_pipeline(
     eps_val = EPS,
 )
 
+from src.specifications.utils.dfa_tool import check_letter_disjointness
+result = check_letter_disjointness(letters, L_list, DFA=DFA)
+if not result["clean"]:
+    raise RuntimeError("Labelling overlap detected on the abstraction grid")
 
 # ===========================================================================
 # 7.  Tree-based value iteration  (Stage 3)
@@ -435,6 +440,7 @@ point_sets = [
     ( -9.4625, -3.8625,  -6.3375, -3.8625,  -9.4625, -1.5125,  -6.3375, -1.5125),
     (-18.0875, -7.2875, -16.8625, -7.2875, -13.5375, -7.2875, -11.8625, -7.2875),
     (  1.4125,  1.2875,   3.3625,  1.2875, -17.8375,  1.2875, -16.8625,  1.2875),
+    # (-7.2875,-7.2875,-7.2875,-7.2875,-7.2875,-7.2875,-7.2875,-7.2875,)
 ]
 
 # Regions to overlay on the figure: (label, (x, y) of lower-left, width, height, text_xy)
@@ -491,3 +497,217 @@ scatter_point_sets_with_agent_colors(
 
 plt.tight_layout()
 plt.show()
+
+# ===========================================================================
+# 10.  2D tv over (agent 0, agent 1) with agents 2-7 pinned, exported to .mat
+#
+# Agents 2,4,6 are held at  1.4125  and agents 3,5,7 at  1.2875; agents 0 and 1
+# sweep their full abstract grids. Because only two dimensions vary, the 8D
+# point query factorises into matrix products, so the whole (N0 x N1) grid is
+# built from a handful of matmuls instead of N0*N1 scalar tv_value_at_point
+# calls. A runtime self-check compares random grid cells against the scalar
+# tv_value_at_point, so equivalence is verified on the real tree.
+# ===========================================================================
+from scipy.io import savemat
+
+
+def tv_grid_2d(G, DFA, L, sysAbs, fixed, *, free=(0, 1),
+               index_mode="nearest", tol=1e-9, selfcheck=24, seed=0):
+    """
+    Satisfaction-probability grid over two free agents with all others pinned.
+
+    Parameters
+    ----------
+    fixed : dict[int, float]
+        Pinned agents -> coordinate value (center coordinates).
+    free : (d0, d1)
+        The two agents that vary; result axis 0 is d0, axis 1 is d1.
+
+    `free` and `fixed` together must cover every agent exactly once.
+
+    Returns
+    -------
+    (centers_d0, centers_d1, tv)  with tv of shape (N_d0, N_d1).
+
+    Equivalent to evaluating tv_value_at_point on the full (d0, d1) grid, via
+        tv[i0,i1] = sum_q  M_q[i0,i1] * LM_q[i0,i1]
+    where, for each DFA destination state q reachable from q0,
+        M_q[i0,i1]  = sum_{n in Q[q]} W(n) V[d0][n,i0] V[d1][n,i1]      (node sum)
+        LM_q[i0,i1] = sum_{l: q0->q} Cmask[l] L[d0][l,i0] L[d1][l,i1]   (labels)
+    and W(n), Cmask[l] collect the fixed-dimension contributions.
+    """
+    d0, d1 = free
+    D = len(sysAbs)
+    if set(free) | set(fixed) != set(range(D)):
+        raise ValueError("free dims + fixed dims must cover all agents exactly")
+
+    q0    = int(DFA.S0[0])
+    trans = np.asarray(DFA.trans, dtype=int)
+
+    centers0 = centers_1d(sysAbs[d0], sysAbs[d0].N)
+    centers1 = centers_1d(sysAbs[d1], sysAbs[d1].N)
+    N0, N1   = centers0.size, centers1.size
+
+    fixed_idx = {}
+    for d, val in fixed.items():
+        cd = centers_1d(sysAbs[d], sysAbs[d].N)
+        fixed_idx[d] = coord_to_index(cd, float(val), mode=index_mode, tol=tol)[0]
+    fixed_dims = sorted(fixed_idx)
+
+    L0 = np.asarray(L[d0], dtype=float)            # (n_letters, N0)
+    L1 = np.asarray(L[d1], dtype=float)            # (n_letters, N1)
+    Cmask = np.ones(trans.shape[1], dtype=float)   # fixed-dim label contribution
+    for d in fixed_dims:
+        Cmask *= np.asarray(L[d], dtype=float)[:, fixed_idx[d]]
+
+    V0 = np.asarray(G.V[d0], dtype=float)          # (n_nodes, N0)
+    V1 = np.asarray(G.V[d1], dtype=float)          # (n_nodes, N1)
+
+    qdsts = [int(q) for q in np.unique(trans[q0, :]) if len(G.Q.get(int(q), [])) > 0]
+
+    tv = np.zeros((N0, N1), dtype=float)
+    for q in qdsts:
+        nodes = np.asarray(G.Q[q], dtype=int)
+        w = np.ones(nodes.size, dtype=float)       # fixed-dim value contribution / node
+        for d in fixed_dims:
+            w *= np.asarray(G.V[d], dtype=float)[nodes, fixed_idx[d]]
+        M_q = (w[:, None] * V0[nodes, :]).T @ V1[nodes, :]          # (N0, N1)
+
+        lsel = np.where(trans[q0, :] == q)[0]
+        if lsel.size == 0:
+            continue
+        LM = (Cmask[lsel][:, None] * L0[lsel, :]).T @ L1[lsel, :]   # (N0, N1)
+        tv += M_q * LM
+
+    # ---- runtime equivalence check against the scalar reference ----
+    if selfcheck:
+        rng = np.random.default_rng(seed)
+        for _ in range(int(selfcheck)):
+            i0, i1 = int(rng.integers(N0)), int(rng.integers(N1))
+            point = [0.0] * D
+            point[d0], point[d1] = float(centers0[i0]), float(centers1[i1])
+            for d in fixed_dims:
+                point[d] = float(centers_1d(sysAbs[d], sysAbs[d].N)[fixed_idx[d]])
+            ref = tv_value_at_point(G, DFA, L, sysAbs, point,
+                                    index_mode=index_mode, tol=tol)
+            if not np.isclose(ref, tv[i0, i1], rtol=1e-6, atol=1e-9):
+                raise AssertionError(
+                    f"self-check failed at ({i0},{i1}): "
+                    f"vectorised {tv[i0, i1]:.6g} vs reference {ref:.6g}")
+
+    return centers0, centers1, tv
+
+
+# agents 2,4,6 -> 1.4125 ; agents 3,5,7 -> 1.2875 ; agents 0,1 swept
+fixed_states = {2: 1.4125, 4: 1.4125, 6: 1.4125,
+                3: 1.2875, 5: 1.2875, 7: 1.2875}
+
+x1, x2, tv2d = tv_grid_2d(G, DFA, L, sysAbs, fixed_states, free=(0, 1))
+
+print(f"\n2D tv grid: {tv2d.shape}  (agent 0 x agent 1)")
+print(f"  range: [{tv2d.min():.4f}, {tv2d.max():.4f}]")
+
+# P is (agent0, agent1); x1/x2 are the agent-0/agent-1 axes (centre coords).
+savemat("tv_pd8d_a01.mat",
+        {"P": tv2d, "x1": x1, "x2": x2, "N": float(tv2d.size)})
+print("saved tv_pd8d_a01.mat")
+
+# ===========================================================================
+# 11.  2D tv with all 4 robots co-located
+#      agents (0,2,4,6) share x ; agents (1,3,5,7) share y
+#      exported to .mat
+#
+# Each (i_x, i_y) cell evaluates sat-prob for the 8D state where every robot
+# starts at (x_{i_x}, y_{i_y}). The per-letter L and per-node V products
+# factor across the even/odd agent groups:
+#     L_even[l, i_x] = prod_{d in {0,2,4,6}} L[d][l, i_x]
+#     L_odd [l, i_y] = prod_{d in {1,3,5,7}} L[d][l, i_y]
+#     V_even[n, i_x] = prod_{d in {0,2,4,6}} V[d][n, i_x]
+#     V_odd [n, i_y] = prod_{d in {1,3,5,7}} V[d][n, i_y]
+# so the (N_x x N_y) grid is built from a handful of matmuls, with a
+# self-check that random cells match the scalar tv_value_at_point reference.
+# ===========================================================================
+
+
+def tv_grid_shared_xy(G, DFA, L, sysAbs, *,
+                      even_dims=(0, 2, 4, 6), odd_dims=(1, 3, 5, 7),
+                      index_mode="nearest", tol=1e-9, selfcheck=24, seed=0):
+    """
+    Satisfaction-probability grid over (x, y) with every robot at (x, y):
+        agents in even_dims share the x-coordinate;
+        agents in odd_dims  share the y-coordinate.
+
+    Returns (centers_x, centers_y, tv) with tv of shape (N_x, N_y).
+    """
+    even_dims = tuple(even_dims)
+    odd_dims  = tuple(odd_dims)
+    D = len(sysAbs)
+    if set(even_dims) | set(odd_dims) != set(range(D)):
+        raise ValueError("even_dims | odd_dims must cover all agents exactly")
+    if set(even_dims) & set(odd_dims):
+        raise ValueError("even_dims and odd_dims must be disjoint")
+
+    q0    = int(DFA.S0[0])
+    trans = np.asarray(DFA.trans, dtype=int)
+
+    centers_x = centers_1d(sysAbs[even_dims[0]], sysAbs[even_dims[0]].N)
+    centers_y = centers_1d(sysAbs[odd_dims[0]],  sysAbs[odd_dims[0]].N)
+    N_x, N_y  = centers_x.size, centers_y.size
+
+    # collapsed per-letter labels across each agent group
+    L_even = np.ones_like(np.asarray(L[even_dims[0]], dtype=float))
+    for d in even_dims:
+        L_even *= np.asarray(L[d], dtype=float)
+    L_odd  = np.ones_like(np.asarray(L[odd_dims[0]],  dtype=float))
+    for d in odd_dims:
+        L_odd  *= np.asarray(L[d], dtype=float)
+
+    # collapsed per-node values across each agent group
+    V_even = np.ones_like(np.asarray(G.V[even_dims[0]], dtype=float))
+    for d in even_dims:
+        V_even *= np.asarray(G.V[d], dtype=float)
+    V_odd  = np.ones_like(np.asarray(G.V[odd_dims[0]],  dtype=float))
+    for d in odd_dims:
+        V_odd  *= np.asarray(G.V[d], dtype=float)
+
+    qdsts = [int(q) for q in np.unique(trans[q0, :]) if len(G.Q.get(int(q), [])) > 0]
+
+    tv = np.zeros((N_x, N_y), dtype=float)
+    for q in qdsts:
+        nodes = np.asarray(G.Q[q], dtype=int)
+        M_q = V_even[nodes, :].T @ V_odd[nodes, :]                  # (N_x, N_y)
+
+        lsel = np.where(trans[q0, :] == q)[0]
+        if lsel.size == 0:
+            continue
+        LM = L_even[lsel, :].T @ L_odd[lsel, :]                     # (N_x, N_y)
+        tv += M_q * LM
+
+    # ---- runtime equivalence check against the scalar reference ----
+    if selfcheck:
+        rng = np.random.default_rng(seed)
+        for _ in range(int(selfcheck)):
+            ix, iy = int(rng.integers(N_x)), int(rng.integers(N_y))
+            point = [0.0] * D
+            for d in even_dims:
+                point[d] = float(centers_x[ix])
+            for d in odd_dims:
+                point[d] = float(centers_y[iy])
+            ref = tv_value_at_point(G, DFA, L, sysAbs, point,
+                                    index_mode=index_mode, tol=tol)
+            if not np.isclose(ref, tv[ix, iy], rtol=1e-6, atol=1e-9):
+                raise AssertionError(
+                    f"self-check failed at (x={ix}, y={iy}): "
+                    f"vectorised {tv[ix, iy]:.6g} vs reference {ref:.6g}")
+
+    return centers_x, centers_y, tv
+
+
+x_shared, y_shared, tv_shared = tv_grid_shared_xy(G, DFA, L, sysAbs)
+
+print(f"\n2D tv grid (all 4 robots co-located): {tv_shared.shape}")
+print(f"  range: [{tv_shared.min():.4f}, {tv_shared.max():.4f}]")
+
+savemat("tv_pd8d_shared.mat",
+        {"P": tv_shared, "x1": x_shared, "x2": y_shared, "N": float(tv_shared.size)})
+print("saved tv_pd8d_shared.mat")
