@@ -26,8 +26,9 @@ The composed operator is:
 Tests:
     test_grid_topology                  : N == Np · Nv per agent; P.l matches.
     test_kernels_column_stochastic      : Pi[0], Pi[1] column-stochastic in
-                                          the interior; boundary cells lose
-                                          ≤ 5% of mass.
+                                          the interior; boundary columns
+                                          retain exactly the in-box Gaussian
+                                          mass for the configured std.
     test_P_det_indicator_structure      : (N, N · NU_total) sparse, every
                                           column has at most one nonzero of
                                           value 1.
@@ -58,6 +59,7 @@ from types import SimpleNamespace
 import numpy as np
 import polytope as pc
 import pytest
+from scipy.stats import norm
 
 from src.models.linmodel               import LinModel
 from src.pipeline                      import build_regions_from_cfg, prepare_pipeline
@@ -76,6 +78,26 @@ NOISE  = 0.5
 POSITION_LO, POSITION_HI = -20.0, 5.0
 VELOCITY_LO, VELOCITY_HI =  -5.0, 5.0
 INPUT_LO,    INPUT_HI    =  -2.0, 2.0
+
+
+def _retention(lo, hi, n, std):
+    """Per cell i of a uniform grid of n cells on [lo, hi]: the mass that a
+    Gaussian centred on the cell centre keeps inside [lo, hi]. This is the
+    exact column sum of the per-axis noise kernel (Gaussian gridding at cell
+    centres). With std = NOISE = 0.5 the outermost cells retain 0.8944
+    (position, h = 1.25) and 0.8413 (velocity, h = 1.0); the next cells in
+    retain 1 - 8.8e-5 and 1 - 1.3e-3. Before the noise-scale fix (dcf8cdd)
+    the builder received the variance 0.25 as std, the edge cells retained
+    0.994 / 0.977 and everything inside was 1 to 1e-9, which is why the old
+    round tolerances (5 % at the edge, 1e-9 inside) used to pass."""
+    h = (hi - lo) / n
+    c = lo + h * (np.arange(n) + 0.5)
+    return norm.cdf((hi - c) / std) - norm.cdf((lo - c) / std)
+
+
+RET = [_retention(POSITION_LO, POSITION_HI, NP, NOISE),   # axis 0: position, (NP,)
+       _retention(VELOCITY_LO, VELOCITY_HI, NV, NOISE)]   # axis 1: velocity, (NV,)
+RETAIN = [RET[0][0], RET[1][0]]                            # edge cells
 
 
 # --------------------------------------------------------------------------
@@ -216,10 +238,10 @@ def test_grid_topology(sys2d):
 
 # --------------------------------------------------------------------------
 # 2.  Per-axis kernels: column-stochastic in the interior; bounded leak at
-#     the two boundary columns of each axis.
+#     the two boundary columns of each axis retain exactly the Gaussian
+#     mass that stays in the box (RETAIN[k]).
 # --------------------------------------------------------------------------
 def test_kernels_column_stochastic(sys2d):
-    LEAK_TOL = 5e-2     # ≥ 95% of mass retained at any boundary cell
     for d in sys2d.agents:
         for k, Pi in enumerate(sys2d.sysAbs[d].P.Pi):
             col_sums = np.asarray(Pi).sum(axis=0)
@@ -228,17 +250,11 @@ def test_kernels_column_stochastic(sys2d):
                 f"[{sys2d.param}] agent {d}, Pi[{k}]: "
                 f"col sum > 1 (max {col_sums.max():.9f})"
             )
-            assert (col_sums >= 1.0 - LEAK_TOL).all(), (
-                f"[{sys2d.param}] agent {d}, Pi[{k}]: "
-                f"col sum < 1 - {LEAK_TOL} (min {col_sums.min():.6f}) — "
-                f"boundary leakage too large"
-            )
-
-            interior = col_sums[1:-1]
-            assert np.allclose(interior, 1.0, atol=1e-9), (
-                f"[{sys2d.param}] agent {d}, Pi[{k}]: "
-                f"interior columns not unit-sum "
-                f"(range [{interior.min():.9f}, {interior.max():.9f}])"
+            assert np.allclose(col_sums, RET[k], atol=1e-9), (
+                f"[{sys2d.param}] agent {d}, Pi[{k}]: column sums differ from "
+                f"the exact in-box Gaussian mass (max |diff| "
+                f"{np.abs(col_sums - RET[k]).max():.3e}; edge expected "
+                f"{RET[k][0]:.6f}, got {col_sums[0]:.6f}; std {NOISE})"
             )
 
 
@@ -302,16 +318,24 @@ def test_full_kernel_row_sums(sys2d):
             f"nonzero row sums"
         )
 
-        inbox_vals = out[~out_of_box]
-        assert (inbox_vals > 0.9).all(), (
-            f"[{sys2d.param}] agent {d}: in-box row sums dropped below 0.9 "
-            f"(min {inbox_vals.min():.6f})"
+        # In-box pairs: the row sum is the product of the two per-axis
+        # retentions at the modal successor cell (A x + B u lands there and the
+        # noise kernels are applied around it).
+        Pd_csc  = P.P_det.tocsc()
+        inbox   = np.flatnonzero(~out_of_box)
+        targets = np.array([Pd_csc.indices[Pd_csc.indptr[c]] for c in inbox])
+        ip_t, iv_t = targets % sys2d.Np, targets // sys2d.Np
+        expected = RET[0][ip_t] * RET[1][iv_t]
+        assert np.allclose(out[inbox], expected, atol=1e-9), (
+            f"[{sys2d.param}] agent {d}: in-box row sums differ from the "
+            f"product of per-axis retentions at the modal successor "
+            f"(max |diff| {np.abs(out[inbox] - expected).max():.3e}, "
+            f"min expected {expected.min():.6f})"
         )
-
-        frac_unity = float(np.isclose(inbox_vals, 1.0, atol=1e-9).mean())
-        assert frac_unity > 0.6, (
+        frac_unity = float(np.isclose(out[inbox], 1.0, atol=1e-9).mean())
+        assert frac_unity > 0.3, (
             f"[{sys2d.param}] agent {d}: only {frac_unity*100:.1f}% of "
-            f"in-box pairs have row sum exactly 1 — interior should dominate"
+            f"in-box pairs have row sum exactly 1"
         )
 
 
